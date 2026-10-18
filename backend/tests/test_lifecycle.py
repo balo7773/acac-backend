@@ -168,7 +168,7 @@ async def test_full_competition_lifecycle(tmp_path, monkeypatch):
         sub_def = await client.post(
             "/api/candidate/submit-defense",
             json={
-                "answer_text": " ".join([" ".join(["If liquidity assumptions fail in year one, our contingency triggers a tiered reserve ratio adjustment."] * 11)] * 11)
+                "answer_text": " ".join(["If liquidity assumptions fail in year one, our contingency triggers a tiered reserve ratio adjustment."] * 14)
             },
             headers=cand_headers,
         )
