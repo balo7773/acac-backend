@@ -1,0 +1,303 @@
+import json
+from typing import Literal, Optional
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+
+from app.core.security import get_judge_context
+
+router = APIRouter(prefix="/api/judge", tags=["judge"])
+
+
+class Phase1ScorePayload(BaseModel):
+    c1: float = Field(..., ge=0, le=100)
+    c2: float = Field(..., ge=0, le=100)
+    c3: float = Field(..., ge=0, le=100)
+    c4: float = Field(..., ge=0, le=100)
+    c5: float = Field(..., ge=0, le=100)
+    conclusion_score: float = Field(..., ge=0, le=30)
+    zero_score_reason: Optional[str] = None
+
+
+class Phase2RevisionPayload(BaseModel):
+    c1: Optional[float] = Field(default=None, ge=0, le=100)
+    c2: Optional[float] = Field(default=None, ge=0, le=100)
+    c3: Optional[float] = Field(default=None, ge=0, le=100)
+    c4: Optional[float] = Field(default=None, ge=0, le=100)
+    c5: Optional[float] = Field(default=None, ge=0, le=100)
+    conclusion_score: Optional[float] = Field(default=None, ge=0, le=30)
+    zero_score_reason: Optional[str] = None
+    revision_reason: Optional[str] = None
+
+
+class RaiseFlagPayload(BaseModel):
+    submission_id: int
+    flag_type: Literal["contradicts_essay", "off_topic"]
+    note: str = Field(..., min_length=5, max_length=1000)
+
+
+class FlagVotePayload(BaseModel):
+    decision: Literal["confirm", "clear"]
+
+
+class Stage2ScorePayload(BaseModel):
+    c1: float = Field(..., ge=0, le=100)
+    c2: float = Field(..., ge=0, le=100)
+    c3: float = Field(..., ge=0, le=100)
+    c4: float = Field(..., ge=0, le=100)
+
+
+@router.get("/submissions")
+async def list_submissions_for_judge(ctx=Depends(get_judge_context)):
+    judge_id, session = ctx
+
+    res = await session.execute(
+        text(
+            """
+            SELECT
+                s.id AS submission_id,
+                s.participant_number,
+                s.word_count,
+                s.page_count,
+                cw.outcome AS conclusion_outcome,
+                COALESCE(js.status, 'not_started') AS judge_session_status,
+                js.phase_2_expires_at
+            FROM submissions s
+            LEFT JOIN conclusion_windows cw ON cw.submission_id = s.id
+            LEFT JOIN judge_sessions js ON js.submission_id = s.id AND js.judge_id = current_user_id()
+            WHERE s.status IN ('submitted', 'auto_locked')
+            ORDER BY s.participant_number ASC
+            """
+        )
+    )
+    return [dict(r) for r in res.mappings().all()]
+
+
+@router.get("/submissions/{submission_id}")
+async def get_submission_evaluation_view(submission_id: int, ctx=Depends(get_judge_context)):
+    judge_id, session = ctx
+
+    # canonical_text is intentionally NOT selected here to avoid leaking full text prematurely
+    sub_res = await session.execute(
+        text(
+            """
+            SELECT
+                s.id AS submission_id,
+                s.participant_number,
+                s.word_count,
+                s.page_count,
+                cw.outcome AS conclusion_outcome,
+                cw.question_text,
+                cw.answer_text
+            FROM submissions s
+            LEFT JOIN conclusion_windows cw ON cw.submission_id = s.id
+            WHERE s.id = :sid
+            """
+        ),
+        {"sid": submission_id},
+    )
+    sub = sub_res.mappings().first()
+    if not sub:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found.")
+
+    bundle_res = await session.execute(
+        text("SELECT get_judge_evaluation_bundle(:sid)"),
+        {"sid": submission_id},
+    )
+    bundle = bundle_res.scalar_one()
+    if isinstance(bundle, str):
+        bundle = json.loads(bundle)
+
+    claims_res = await session.execute(
+        text(
+            """
+            SELECT id, model_name, claim_type, claim_text, quote_text, quote_start, quote_end
+            FROM ai_claims
+            WHERE submission_id = :sid
+            ORDER BY id ASC
+            """
+        ),
+        {"sid": submission_id},
+    )
+    claims = [dict(r) for r in claims_res.mappings().all()]
+
+    scores_res = await session.execute(
+        text(
+            """
+            SELECT criterion_key, initial_raw_score, final_raw_score
+            FROM essay_scores
+            WHERE submission_id = :sid
+            ORDER BY criterion_key ASC
+            """
+        ),
+        {"sid": submission_id},
+    )
+    essay_scores = [dict(r) for r in scores_res.mappings().all()]
+
+    conc_res = await session.execute(
+        text(
+            """
+            SELECT initial_raw_score, final_raw_score, zero_score_reason
+            FROM conclusion_scores
+            WHERE submission_id = :sid
+            """
+        ),
+        {"sid": submission_id},
+    )
+    conc_score = conc_res.mappings().first()
+
+    flags_res = await session.execute(
+        text(
+            """
+            SELECT id, flag_type, raised_by, evidence, status, resolved_at, created_at
+            FROM flags
+            WHERE submission_id = :sid
+            ORDER BY id ASC
+            """
+        ),
+        {"sid": submission_id},
+    )
+    flags = [dict(r) for r in flags_res.mappings().all()]
+
+    return {
+        "submission": dict(sub),
+        "bundle": bundle,
+        "ai_claims": claims,
+        "my_essay_scores": essay_scores,
+        "my_conclusion_score": dict(conc_score) if conc_score else None,
+        "flags": flags,
+    }
+
+
+@router.post("/submissions/{submission_id}/open-full")
+@router.post("/submissions/{submission_id}/mark-read")
+async def open_full_essay(submission_id: int, ctx=Depends(get_judge_context)):
+    judge_id, session = ctx
+    try:
+        res = await session.execute(
+            text("SELECT open_full_essay_for_judge(:sid)"),
+            {"sid": submission_id},
+        )
+        canon = res.scalar_one()
+    except DBAPIError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e.orig))
+
+    return {
+        "submission_id": submission_id,
+        "opened_full_essay": True,
+        "canonical_text": canon,
+    }
+
+
+@router.post("/submissions/{submission_id}/lock-phase1")
+async def lock_phase1(
+    submission_id: int,
+    payload: Phase1ScorePayload,
+    ctx=Depends(get_judge_context),
+):
+    judge_id, session = ctx
+    try:
+        res = await session.execute(
+            text(
+                "SELECT lock_phase1_scores(:sid, :c1, :c2, :c3, :c4, :c5, :conc, :zreason)"
+            ),
+            {
+                "sid": submission_id,
+                "c1": payload.c1,
+                "c2": payload.c2,
+                "c3": payload.c3,
+                "c4": payload.c4,
+                "c5": payload.c5,
+                "conc": payload.conclusion_score,
+                "zreason": payload.zero_score_reason,
+            },
+        )
+        expires_at = res.scalar_one()
+    except DBAPIError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e.orig))
+
+    return {
+        "submission_id": submission_id,
+        "session_status": "phase_2_review",
+        "phase_2_expires_at": expires_at,
+    }
+
+
+@router.post("/submissions/{submission_id}/submit-phase2")
+async def submit_phase2(
+    submission_id: int,
+    payload: Phase2RevisionPayload,
+    ctx=Depends(get_judge_context),
+):
+    judge_id, session = ctx
+    try:
+        res = await session.execute(
+            text(
+                "SELECT submit_phase2_revisions(:sid, :c1, :c2, :c3, :c4, :c5, :conc, :zreason, :revreason)"
+            ),
+            {
+                "sid": submission_id,
+                "c1": payload.c1,
+                "c2": payload.c2,
+                "c3": payload.c3,
+                "c4": payload.c4,
+                "c5": payload.c5,
+                "conc": payload.conclusion_score,
+                "zreason": payload.zero_score_reason,
+                "revreason": payload.revision_reason,
+            },
+        )
+        new_status = res.scalar_one()
+    except DBAPIError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e.orig))
+
+    return {"submission_id": submission_id, "session_status": new_status}
+
+
+@router.post("/flags", status_code=status.HTTP_201_CREATED)
+async def raise_integrity_flag(payload: RaiseFlagPayload, ctx=Depends(get_judge_context)):
+    judge_id, session = ctx
+    try:
+        res = await session.execute(
+            text("SELECT raise_judge_flag(:sid, :ftype, :note)"),
+            {"sid": payload.submission_id, "ftype": payload.flag_type, "note": payload.note},
+        )
+        out = res.scalar_one()
+        if isinstance(out, str):
+            out = json.loads(out)
+        return out
+    except DBAPIError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e.orig))
+
+
+@router.post("/flags/{flag_id}/review")
+async def review_flag(flag_id: int, payload: FlagVotePayload, ctx=Depends(get_judge_context)):
+    judge_id, session = ctx
+    try:
+        res = await session.execute(
+            text("SELECT submit_flag_review(:fid, :dec)"),
+            {"fid": flag_id, "dec": payload.decision},
+        )
+        resulting_status = res.scalar_one()
+    except DBAPIError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e.orig))
+
+    return {"flag_id": flag_id, "resulting_status": resulting_status}
+
+
+@router.post("/stage2/{submission_id}/score")
+async def submit_stage2_live_score(
+    submission_id: int,
+    payload: Stage2ScorePayload,
+    ctx=Depends(get_judge_context),
+):
+    judge_id, session = ctx
+    try:
+        await session.execute(
+            text("SELECT submit_stage2_scores(:sid, :c1, :c2, :c3, :c4)"),
+            {"sid": submission_id, "c1": payload.c1, "c2": payload.c2, "c3": payload.c3, "c4": payload.c4},
+        )
+    except DBAPIError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e.orig))
+    return {"submission_id": submission_id, "status": "stage2_recorded"}
