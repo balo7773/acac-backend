@@ -1267,3 +1267,148 @@ async def test_p2_fix_1_conclusion_word_bounds(tmp_path, monkeypatch):
 
         while await process_next_queued_job():
             pass
+
+@pytest.mark.asyncio
+async def test_p2_fix_2_judge_scale_internal_vs_external(tmp_path, monkeypatch):
+    """2.6 Option B: internal judges 0-100 continuous, external judges whole 0-3.
+       Both lock-phase1 and submit-phase2 reject out-of-scale values with 422."""
+    monkeypatch.setattr(config.settings, "UPLOAD_DIR", str(tmp_path))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        # Ensure admin + open phase
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text(
+                    "INSERT INTO admins (username, password_hash) "
+                    "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"
+                ),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text(
+                    "UPDATE competition_state SET current_phase = 'stage_1_submitting', "
+                    "stage_1_submission_deadline = NULL WHERE id = 1"
+                )
+            )
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # Create 1 internal + 1 external judge
+        sfx = uuid.uuid4().hex[:6]
+        tokens = {}
+        for label, jtype in [("int_a", "internal"), ("ext", "external")]:
+            uname = f"scale_{label}_{sfx}"
+            r = await client.post(
+                "/api/admin/judges",
+                json={"username": uname, "password": "JP_2026!", "judge_type": jtype, "mask_avatar": "mask_owl"},
+                headers=adm_headers,
+            )
+            assert r.status_code == 201, r.text
+            lr = await client.post(
+                "/api/auth/login",
+                json={"identifier": uname, "password": "JP_2026!", "role": "judge"},
+            )
+            assert lr.status_code == 200, lr.text
+            tokens[label] = _extract_cookie_val(lr)
+
+        # Register candidate, upload, submit
+        reg = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Scale Test Candidate",
+                "matric_number": f"AFIT/SCT/{sfx}",
+                "whatsapp_number": f"+234899{sfx[:4]}11",
+                "linkedin_url": "https://linkedin.com/in/sct",
+                "password": "Password123!",
+            },
+        )
+        assert reg.status_code == 201, reg.text
+        pno = reg.json()["participant_number"]
+        cand_headers = {"Authorization": f"Bearer {_extract_cookie_val(reg)}"}
+
+        doc = fitz.open()
+        sentence = "Comprehensive fiscal policy reforms require sustained institutional capacity and disciplined macroeconomic coordination. "
+        for _ in range(3):
+            p = doc.new_page()
+            p.insert_textbox(fitz.Rect(50, 50, 550, 750), sentence * 40, fontsize=9)
+        pdf_bytes = doc.tobytes()
+        doc.close()
+
+        up = await client.post(
+            "/api/candidate/upload-draft",
+            files={"file": (f"{pno}.pdf", pdf_bytes, "application/pdf")},
+            headers=cand_headers,
+        )
+        assert up.status_code == 200, up.text
+
+        sub = await client.post(
+            "/api/candidate/submit-final",
+            json={"accepted_rules": True, "rules_version": "v1.0"},
+            headers=cand_headers,
+        )
+        assert sub.status_code == 200, sub.text
+        sub_id = sub.json()["submission_id"]
+
+        while await process_next_queued_job():
+            pass
+
+        ph = await client.post(
+            "/api/admin/phase",
+            json={"new_phase": "stage_1_grading"},
+            headers=adm_headers,
+        )
+        assert ph.status_code == 200
+
+        # External judge: open submission, then probe invalid scales
+        ext_h = {"Authorization": f"Bearer {tokens['ext']}"}
+        open_ext = await client.get(f"/api/judge/submissions/{sub_id}", headers=ext_h)
+        assert open_ext.status_code == 200
+
+        for bad in [2.5, -0.5, 3.5]:
+            r = await client.post(
+                f"/api/judge/submissions/{sub_id}/lock-phase1",
+                json={"c1": bad, "c2": 2, "c3": 2, "c4": 2, "c5": 2, "conclusion_score": 25},
+                headers=ext_h,
+            )
+            assert r.status_code == 422, f"external {bad} -> {r.status_code}: {r.text}"
+
+        # External judge: valid 3s must succeed
+        ok_ext = await client.post(
+            f"/api/judge/submissions/{sub_id}/lock-phase1",
+            json={"c1": 3, "c2": 3, "c3": 3, "c4": 3, "c5": 3, "conclusion_score": 25},
+            headers=ext_h,
+        )
+        assert ok_ext.status_code == 200, ok_ext.text
+
+        # External judge: submit-phase2 with 2.5 must be 422
+        bad_p2 = await client.post(
+            f"/api/judge/submissions/{sub_id}/submit-phase2",
+            json={"c1": 2.5, "revision_reason": "scale test"},
+            headers=ext_h,
+        )
+        assert bad_p2.status_code == 422, bad_p2.text
+
+        # Internal judge: open submission, then probe out-of-range
+        int_h = {"Authorization": f"Bearer {tokens['int_a']}"}
+        open_int = await client.get(f"/api/judge/submissions/{sub_id}", headers=int_h)
+        assert open_int.status_code == 200
+
+        for bad in [105, -5]:
+            r = await client.post(
+                f"/api/judge/submissions/{sub_id}/lock-phase1",
+                json={"c1": bad, "c2": 80, "c3": 80, "c4": 80, "c5": 80, "conclusion_score": 25},
+                headers=int_h,
+            )
+            assert r.status_code == 422, f"internal {bad} -> {r.status_code}: {r.text}"
+
+
