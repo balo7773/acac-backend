@@ -10,6 +10,26 @@ from app.core.security import get_judge_context
 router = APIRouter(prefix="/api/judge", tags=["judge"])
 
 
+def _validate_scores_by_judge_type(judge_type: str, scores: dict) -> None:
+    """Enforce internal 0-100 continuous, external whole 0-3."""
+    for key, value in scores.items():
+        if value is None:
+            continue
+        f = float(value)
+        if judge_type == "external":
+            if not (f.is_integer() and 0.0 <= f <= 3.0):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"External judge scores must be whole numbers 0, 1, 2, or 3; got {value} for {key}.",
+                )
+        else:
+            if not (0.0 <= f <= 100.0):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Internal judge scores must be between 0.00 and 100.00; got {value} for {key}.",
+                )
+
+
 class Phase1ScorePayload(BaseModel):
     c1: float = Field(..., ge=0, le=100)
     c2: float = Field(..., ge=0, le=100)
@@ -197,6 +217,14 @@ async def lock_phase1(
     ctx=Depends(get_judge_context),
 ):
     judge_id, session = ctx
+    jt = await session.execute(
+        text("SELECT judge_type FROM judges WHERE id = current_user_id()")
+    )
+    judge_type = jt.scalar_one()
+    _validate_scores_by_judge_type(
+        judge_type,
+        {"c1": payload.c1, "c2": payload.c2, "c3": payload.c3, "c4": payload.c4, "c5": payload.c5},
+    )
     try:
         res = await session.execute(
             text(
@@ -231,6 +259,14 @@ async def submit_phase2(
     ctx=Depends(get_judge_context),
 ):
     judge_id, session = ctx
+    jt = await session.execute(
+        text("SELECT judge_type FROM judges WHERE id = current_user_id()")
+    )
+    judge_type = jt.scalar_one()
+    _validate_scores_by_judge_type(
+        judge_type,
+        {"c1": payload.c1, "c2": payload.c2, "c3": payload.c3, "c4": payload.c4, "c5": payload.c5},
+    )
     try:
         res = await session.execute(
             text(

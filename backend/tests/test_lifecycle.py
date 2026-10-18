@@ -237,22 +237,39 @@ async def test_full_competition_lifecycle(tmp_path, monkeypatch):
         assert good_rev.json()["session_status"] == "locked_final"
 
         # 12. Judges 2 and 3 open submission, then complete Phase 1 and Phase 2
-        for j_tok in judge_tokens[1:]:
-            jh = {"Authorization": f"Bearer {j_tok}"}
-            open_j = await client.get(f"/api/judge/submissions/{sub_id}", headers=jh)
-            assert open_j.status_code == 200
-            l_res = await client.post(
-                f"/api/judge/submissions/{sub_id}/lock-phase1",
-                json={"c1": 80, "c2": 80, "c3": 80, "c4": 80, "c5": 80, "conclusion_score": 25},
-                headers=jh,
-            )
-            assert l_res.status_code == 200
-            s_res = await client.post(
-                f"/api/judge/submissions/{sub_id}/submit-phase2",
-                json={},
-                headers=jh,
-            )
-            assert s_res.status_code == 200
+        # Judge 2 = internal (0-100 continuous)
+        jh2 = {"Authorization": f"Bearer {judge_tokens[1]}"}
+        open2 = await client.get(f"/api/judge/submissions/{sub_id}", headers=jh2)
+        assert open2.status_code == 200
+        l_res2 = await client.post(
+            f"/api/judge/submissions/{sub_id}/lock-phase1",
+            json={"c1": 80, "c2": 80, "c3": 80, "c4": 80, "c5": 80, "conclusion_score": 25},
+            headers=jh2,
+        )
+        assert l_res2.status_code == 200
+        s_res2 = await client.post(
+            f"/api/judge/submissions/{sub_id}/submit-phase2",
+            json={},
+            headers=jh2,
+        )
+        assert s_res2.status_code == 200
+
+        # Judge 3 = external (whole numbers 0-3 only)
+        jh3 = {"Authorization": f"Bearer {judge_tokens[2]}"}
+        open3 = await client.get(f"/api/judge/submissions/{sub_id}", headers=jh3)
+        assert open3.status_code == 200
+        l_res3 = await client.post(
+            f"/api/judge/submissions/{sub_id}/lock-phase1",
+            json={"c1": 3, "c2": 3, "c3": 3, "c4": 3, "c5": 3, "conclusion_score": 25},
+            headers=jh3,
+        )
+        assert l_res3.status_code == 200
+        s_res3 = await client.post(
+            f"/api/judge/submissions/{sub_id}/submit-phase2",
+            json={},
+            headers=jh3,
+        )
+        assert s_res3.status_code == 200
 
         # 13. Admin computes Stage 1 Leaderboard
         comp_res = await client.post("/api/admin/compute-stage1", headers=admin_headers)
@@ -261,4 +278,10 @@ async def test_full_competition_lifecycle(tmp_path, monkeypatch):
         assert len(board) >= 1
         target_row = next((r for r in board if r["submission_id"] == sub_id), None)
         assert target_row is not None, f"Submission {sub_id} not found on leaderboard"
-        assert float(target_row["composite_score"]) > 80.0
+        # Judge 1 (internal, c1 revised 80->90 in Phase 2, c2-c5=80):
+        #   essay = (90*.15 + 80*.25 + 80*.25 + 80*.25 + 80*.10) * .70 = 57.05, +25 = 82.05, weight 1
+        # Judge 2 (internal, all 80): essay 56.0, +25 = 81.0, weight 1
+        # Judge 3 (external, all 3 -> normalized to 100): essay 70.0, +25 = 95.0, weight 2
+        # Composite = (82.05*1 + 81*1 + 95*2) / (1+1+2) = 353.05/4 = 88.2625
+        assert abs(float(target_row["composite_score"]) - 88.2625) < 0.01, \
+            f"Expected composite 88.2625, got {target_row['composite_score']}"

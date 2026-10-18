@@ -520,10 +520,7 @@ GRANT EXECUTE ON FUNCTION submit_flag_review(INT, TEXT) TO judge_role, admin_rol
 -- ----------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION compute_stage1_results()
-RETURNS INT
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = public
+RETURNS INT LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
 AS $$
 DECLARE
     v_cfg settings%ROWTYPE;
@@ -531,42 +528,30 @@ DECLARE
     v_count INT;
 BEGIN
     SELECT * INTO v_cfg FROM settings WHERE is_active = TRUE;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'No active settings configuration found.';
-    END IF;
-
-    -- Clear prior computation snapshot for fresh recalculation
+    IF NOT FOUND THEN RAISE EXCEPTION 'No active settings configuration found.'; END IF;
     DELETE FROM stage1_results;
-
     WITH active_judge_weights AS (
-        SELECT
-            id AS judge_id,
+        SELECT id AS judge_id, judge_type,
             CASE WHEN judge_type = 'external' THEN v_cfg.weight_external_judge
-                 ELSE v_cfg.weight_internal_judge
-            END AS j_weight
-        FROM judges
-        WHERE is_active = TRUE
+                 ELSE v_cfg.weight_internal_judge END AS j_weight
+        FROM judges WHERE is_active = TRUE
     ),
     judge_essay_totals AS (
-        SELECT
-            es.submission_id,
-            es.judge_id,
-            ajw.j_weight,
+        SELECT es.submission_id, es.judge_id, ajw.j_weight,
             SUM(
-                COALESCE(es.final_raw_score, es.initial_raw_score) *
+                (CASE WHEN ajw.judge_type = 'external'
+                      THEN COALESCE(es.final_raw_score, es.initial_raw_score) * (100.0 / 3.0)
+                      ELSE COALESCE(es.final_raw_score, es.initial_raw_score) END) *
                 COALESCE((v_cfg.criteria_weights ->> es.criterion_key)::NUMERIC, 0)
             ) * (v_cfg.essay_weight_pct / 100.0) AS weighted_essay_70
         FROM essay_scores es
         JOIN judge_sessions js ON js.submission_id = es.submission_id AND js.judge_id = es.judge_id
         JOIN active_judge_weights ajw ON ajw.judge_id = es.judge_id
         WHERE js.status = 'locked_final'
-        GROUP BY es.submission_id, es.judge_id, ajw.j_weight
+        GROUP BY es.submission_id, es.judge_id, ajw.j_weight, ajw.judge_type
     ),
     judge_conc_totals AS (
-        SELECT
-            cs.submission_id,
-            cs.judge_id,
-            ajw.j_weight,
+        SELECT cs.submission_id, cs.judge_id, ajw.j_weight,
             COALESCE(cs.final_raw_score, cs.initial_raw_score) AS conc_30
         FROM conclusion_scores cs
         JOIN judge_sessions js ON js.submission_id = cs.submission_id AND js.judge_id = cs.judge_id
@@ -574,66 +559,40 @@ BEGIN
         WHERE js.status = 'locked_final'
     ),
     aggregated_scores AS (
-        SELECT
-            s.id AS submission_id,
+        SELECT s.id AS submission_id,
             ROUND(SUM(jet.weighted_essay_70 * jet.j_weight) / NULLIF(SUM(jet.j_weight), 0), 4) AS final_essay_score,
-            CASE
-                WHEN cw.outcome = 'auto_zero' OR EXISTS (
-                    SELECT 1 FROM flags f WHERE f.submission_id = s.id AND f.status = 'confirmed'
-                ) THEN 0
-                ELSE ROUND(SUM(jct.conc_30 * jct.j_weight) / NULLIF(SUM(jct.j_weight), 0), 4)
-            END AS final_conc_score
+            CASE WHEN cw.outcome = 'auto_zero' OR EXISTS (
+                SELECT 1 FROM flags f WHERE f.submission_id = s.id AND f.status = 'confirmed')
+                THEN 0
+                ELSE ROUND(SUM(jct.conc_30 * jct.j_weight) / NULLIF(SUM(jct.j_weight), 0), 4) END AS final_conc_score
         FROM submissions s
         JOIN candidates c ON c.id = s.candidate_id
         LEFT JOIN conclusion_windows cw ON cw.submission_id = s.id
         JOIN judge_essay_totals jet ON jet.submission_id = s.id
         JOIN judge_conc_totals jct ON jct.submission_id = s.id AND jct.judge_id = jet.judge_id
-        WHERE s.status IN ('submitted', 'auto_locked')
-          AND c.is_disqualified = FALSE
+        WHERE s.status IN ('submitted', 'auto_locked') AND c.is_disqualified = FALSE
         GROUP BY s.id, cw.outcome
         HAVING COUNT(DISTINCT jet.judge_id) >= v_cfg.min_active_judges
     ),
     ranked_submissions AS (
-        SELECT
-            submission_id,
-            final_essay_score,
-            final_conc_score,
+        SELECT submission_id, final_essay_score, final_conc_score,
             (final_essay_score + final_conc_score) AS comp_score,
             RANK() OVER (ORDER BY (final_essay_score + final_conc_score) DESC, final_essay_score DESC) AS rnk
         FROM aggregated_scores
     )
-    INSERT INTO stage1_results (
-        submission_id, essay_score, conclusion_score, composite_score, rank, is_in_blur_zone, settings_version
-    )
-    SELECT
-        submission_id,
-        final_essay_score,
-        final_conc_score,
-        comp_score,
-        rnk,
-        FALSE,
-        v_cfg.version
+    INSERT INTO stage1_results (submission_id, essay_score, conclusion_score, composite_score, rank, is_in_blur_zone, settings_version)
+    SELECT submission_id, final_essay_score, final_conc_score, comp_score, rnk, FALSE, v_cfg.version
     FROM ranked_submissions;
-
-    -- Determine cutoff score at top_finalists_target and mark blur zone
-    SELECT composite_score INTO v_cutoff_score
-    FROM stage1_results
-    WHERE rank <= v_cfg.top_finalists_target
-    ORDER BY rank DESC
-    LIMIT 1;
-
+    SELECT composite_score INTO v_cutoff_score FROM stage1_results
+    WHERE rank <= v_cfg.top_finalists_target ORDER BY rank DESC LIMIT 1;
     IF v_cutoff_score IS NOT NULL THEN
-        UPDATE stage1_results
-        SET is_in_blur_zone = TRUE
+        UPDATE stage1_results SET is_in_blur_zone = TRUE
         WHERE ABS(composite_score - v_cutoff_score) <= v_cfg.blur_margin;
     END IF;
-
     GET DIAGNOSTICS v_count = ROW_COUNT;
-
     INSERT INTO audit_log (actor_role, actor_id, action, target_type, details)
     VALUES ('admin', current_user_id(), 'stage1_results_computed', 'stage1_results',
             jsonb_build_object('settings_version', v_cfg.version, 'cutoff_score', v_cutoff_score));
-
     RETURN (SELECT COUNT(*) FROM stage1_results);
 END;
 $$;
