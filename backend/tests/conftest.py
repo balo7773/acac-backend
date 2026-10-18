@@ -1,7 +1,22 @@
 import pytest
-from app.core.database import engine
+from sqlalchemy import text
+from app.core.database import engine, get_rls_session
 
 @pytest.fixture(autouse=True)
 async def dispose_engine_pool():
     yield
     await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def reset_competition_phase():
+    """2.9b: phase transitions are forward-only. Every test body starts from
+    'pre_launch' so endpoint-driven transitions validate deterministically.
+    Tests that need a specific starting phase set it themselves."""
+    async with get_rls_session("admin_role") as session:
+        await session.execute(
+            text(
+                "UPDATE competition_state SET current_phase = 'pre_launch' WHERE id = 1"
+            )
+        )
+    yield

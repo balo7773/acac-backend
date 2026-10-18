@@ -36,9 +36,45 @@ class FinalistCheckRequest(BaseModel):
     reason: Optional[str] = None
 
 
+PHASE_CHAIN = [
+    "pre_launch",
+    "stage_1_submitting",
+    "stage_1_grading",
+    "stage_1_review",
+    "finalist_check",
+    "results_published",
+    "stage_2_live",
+    "completed",
+]
+PHASE_INDEX = {name: i for i, name in enumerate(PHASE_CHAIN)}
+
+
+def _allowed_next_phase(current: str):
+    i = PHASE_INDEX.get(current)
+    if i is None or i + 1 >= len(PHASE_CHAIN):
+        return None
+    return PHASE_CHAIN[i + 1]
+
+
 @router.post("/phase")
 async def update_competition_phase(payload: PhaseUpdateRequest, ctx=Depends(get_admin_context)):
     admin_id, session = ctx
+
+    cur_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    current_phase = cur_res.scalar_one()
+
+    if payload.new_phase != current_phase:
+        allowed = _allowed_next_phase(current_phase)
+        if payload.new_phase != allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Cannot transition from '{current_phase}' to '{payload.new_phase}'. "
+                    f"Allowed next: '{allowed or 'none (terminal)'}'."
+                ),
+            )
 
     await session.execute(
         text(

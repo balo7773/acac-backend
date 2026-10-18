@@ -1559,3 +1559,93 @@ async def test_p2_fix_3_admin_sees_identity_with_audit_trail(tmp_path, monkeypat
         assert post_count == pre_count + 1
 
 
+@pytest.mark.asyncio
+async def test_p2_fix_4_phase_transition_guards():
+    """2.9b: forward-only, single-step transitions.
+    - Skip (pre_launch -> completed) -> 403
+    - Backward -> 403
+    - Idempotent same-phase -> 200
+    - Full forward walk -> all 200
+    - Terminal (anything after completed) -> 403
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text(
+                    "INSERT INTO admins (username, password_hash) "
+                    "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"
+                ),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # Skip: pre_launch -> completed must be 403
+        r = await client.post(
+            "/api/admin/phase",
+            json={"new_phase": "completed"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 403, r.text
+        detail = r.json()["detail"]
+        assert "Cannot transition from 'pre_launch' to 'completed'" in detail
+        assert "Allowed next: 'stage_1_submitting'" in detail
+
+        # Valid first step
+        r = await client.post(
+            "/api/admin/phase",
+            json={"new_phase": "stage_1_submitting"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+
+        # Idempotent same-phase -> 200
+        r = await client.post(
+            "/api/admin/phase",
+            json={"new_phase": "stage_1_submitting"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+
+        # Backward -> 403
+        r = await client.post(
+            "/api/admin/phase",
+            json={"new_phase": "pre_launch"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 403, r.text
+
+        # Full forward walk
+        for nxt in [
+            "stage_1_grading",
+            "stage_1_review",
+            "finalist_check",
+            "results_published",
+            "stage_2_live",
+            "completed",
+        ]:
+            r = await client.post(
+                "/api/admin/phase",
+                json={"new_phase": nxt},
+                headers=adm_headers,
+            )
+            assert r.status_code == 200, f"{nxt}: {r.text}"
+
+        # Terminal: any move out of 'completed' -> 403
+        r = await client.post(
+            "/api/admin/phase",
+            json={"new_phase": "stage_1_grading"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 403, r.text
+        assert "none (terminal)" in r.json()["detail"]
+
