@@ -93,7 +93,7 @@ async def sweep_expired_timers(session: AsyncSession) -> Tuple[int, int]:
                 """
                 INSERT INTO audit_log (actor_role, actor_id, action, target_type, target_id, details)
                 VALUES ('worker', :jid, 'phase_2_expired_locked', 'submission', :sid,
-                        jsonb_build_object('judge_session_id', :jsid))
+                        jsonb_build_object('judge_session_id', CAST(:jsid AS integer)))
                 """
             ),
             {"jid": row.judge_id, "sid": row.submission_id, "jsid": row.id},

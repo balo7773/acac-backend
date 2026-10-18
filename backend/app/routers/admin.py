@@ -123,7 +123,54 @@ async def trigger_stage1_computation(ctx=Depends(get_admin_context)):
             """
         )
     )
-    return {"leaderboard": [dict(r) for r in res.mappings().all()]}
+    rows = [dict(r) for r in res.mappings().all()]
+
+    await session.execute(
+        text(
+            """
+            INSERT INTO audit_log
+                (actor_role, actor_id, action, target_type, target_id, details)
+            VALUES
+                ('admin', :aid, 'stage1_leaderboard_viewed_with_identity',
+                 'stage1_results', NULL, CAST(:det AS jsonb))
+            """
+        ),
+        {"aid": admin_id, "det": json.dumps({"row_count": len(rows)})},
+    )
+
+    return {"leaderboard": rows}
+
+
+@router.get("/names")
+async def list_candidate_names(ctx=Depends(get_admin_context)):
+    """Return the participant_number -> real identity mapping. Admin only.
+    Every call writes exactly one audit_log row."""
+    admin_id, session = ctx
+    res = await session.execute(
+        text(
+            """
+            SELECT participant_number, full_name, matric_number, whatsapp_number
+            FROM candidates
+            ORDER BY participant_number ASC
+            """
+        )
+    )
+    rows = [dict(r) for r in res.mappings().all()]
+
+    await session.execute(
+        text(
+            """
+            INSERT INTO audit_log
+                (actor_role, actor_id, action, target_type, target_id, details)
+            VALUES
+                ('admin', :aid, 'identity_mapping_viewed', 'candidates', NULL,
+                 CAST(:det AS jsonb))
+            """
+        ),
+        {"aid": admin_id, "det": json.dumps({"row_count": len(rows)})},
+    )
+
+    return {"mapping": rows, "count": len(rows)}
 
 
 @router.post("/finalist-check")
@@ -176,7 +223,22 @@ async def trigger_final_computation(ctx=Depends(get_admin_context)):
             """
         )
     )
-    return {"final_standings": [dict(r) for r in res.mappings().all()]}
+    rows = [dict(r) for r in res.mappings().all()]
+
+    await session.execute(
+        text(
+            """
+            INSERT INTO audit_log
+                (actor_role, actor_id, action, target_type, target_id, details)
+            VALUES
+                ('admin', :aid, 'final_standings_viewed_with_identity',
+                 'final_results', NULL, CAST(:det AS jsonb))
+            """
+        ),
+        {"aid": admin_id, "det": json.dumps({"row_count": len(rows)})},
+    )
+
+    return {"final_standings": rows}
 
 
 @router.get("/audit-log")

@@ -1398,6 +1398,15 @@ async def test_p2_fix_2_judge_scale_internal_vs_external(tmp_path, monkeypatch):
         )
         assert bad_p2.status_code == 422, bad_p2.text
 
+        # IMPORTANT: lock external judge's session so no phase_2_review residue remains
+        # (otherwise sweep_expired_timers in later tests picks up this leftover)
+        good_p2 = await client.post(
+            f"/api/judge/submissions/{sub_id}/submit-phase2",
+            json={},
+            headers=ext_h,
+        )
+        assert good_p2.status_code == 200, good_p2.text
+
         # Internal judge: open submission, then probe out-of-range
         int_h = {"Authorization": f"Bearer {tokens['int_a']}"}
         open_int = await client.get(f"/api/judge/submissions/{sub_id}", headers=int_h)
@@ -1410,5 +1419,143 @@ async def test_p2_fix_2_judge_scale_internal_vs_external(tmp_path, monkeypatch):
                 headers=int_h,
             )
             assert r.status_code == 422, f"internal {bad} -> {r.status_code}: {r.text}"
+
+
+
+@pytest.mark.asyncio
+async def test_p2_fix_3_admin_sees_identity_with_audit_trail(tmp_path, monkeypatch):
+    """2.9a per product decision: admin sees identity on all result endpoints.
+    Compensating control: every identity-bearing view writes exactly one audit_log row.
+    Also verifies GET /api/admin/names is audited."""
+    monkeypatch.setattr(config.settings, "UPLOAD_DIR", str(tmp_path))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        # Seed admin, open phase
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text(
+                    "INSERT INTO admins (username, password_hash) "
+                    "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"
+                ),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text(
+                    "UPDATE competition_state SET current_phase = 'stage_1_submitting', "
+                    "stage_1_submission_deadline = NULL WHERE id = 1"
+                )
+            )
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # Register 1 candidate
+        sfx = uuid.uuid4().hex[:6]
+        reg = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": f"Audit Person {sfx}",
+                "matric_number": f"AFIT/AUD/{sfx}",
+                "whatsapp_number": f"+234899{sfx[:4]}22",
+                "linkedin_url": "https://linkedin.com/in/aud",
+                "password": "Password123!",
+            },
+        )
+        assert reg.status_code == 201, reg.text
+
+        # --- 1. compute-stage1: response includes identity keys, audit row written ---
+        async with get_rls_session("admin_role") as session:
+            pre = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE action = 'stage1_leaderboard_viewed_with_identity'"
+                )
+            )
+            pre_count = pre.scalar_one()
+
+        r1 = await client.post("/api/admin/compute-stage1", headers=adm_headers)
+        assert r1.status_code == 200, r1.text
+        board = r1.json()["leaderboard"]
+        # Response may be empty (no locked_final scores), but the audit row must be written
+        async with get_rls_session("admin_role") as session:
+            post = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE action = 'stage1_leaderboard_viewed_with_identity'"
+                )
+            )
+            post_count = post.scalar_one()
+        assert post_count == pre_count + 1, \
+            f"Expected 1 new stage1 audit row, got {post_count - pre_count}"
+        # If leaderboard has rows, each must expose identity fields
+        for row in board:
+            assert "full_name" in row
+            assert "matric_number" in row
+            assert "whatsapp_number" in row
+
+        # --- 2. compute-final: same pattern ---
+        async with get_rls_session("admin_role") as session:
+            pre = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE action = 'final_standings_viewed_with_identity'"
+                )
+            )
+            pre_count = pre.scalar_one()
+
+        r2 = await client.post("/api/admin/compute-final", headers=adm_headers)
+        assert r2.status_code == 200, r2.text
+        standings = r2.json()["final_standings"]
+        async with get_rls_session("admin_role") as session:
+            post = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE action = 'final_standings_viewed_with_identity'"
+                )
+            )
+            post_count = post.scalar_one()
+        assert post_count == pre_count + 1
+        for row in standings:
+            assert "full_name" in row
+            assert "matric_number" in row
+
+        # --- 3. GET /api/admin/names: audited ---
+        async with get_rls_session("admin_role") as session:
+            pre = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE action = 'identity_mapping_viewed'"
+                )
+            )
+            pre_count = pre.scalar_one()
+
+        r3 = await client.get("/api/admin/names", headers=adm_headers)
+        assert r3.status_code == 200, r3.text
+        names = r3.json()["mapping"]
+        # Registration uppercases matric_number (matric_clean = ...upper()), so expected must match
+        expected_matric = f"AFIT/AUD/{sfx}".upper()
+        assert len(names) > 0, "/api/admin/names returned empty mapping (RLS scope?)"
+        sample = [n["matric_number"] for n in names[:3]]
+        assert any(n["matric_number"] == expected_matric for n in names), \
+            f"Matric {expected_matric} not found in {len(names)} name rows (sample: {sample})"
+
+        async with get_rls_session("admin_role") as session:
+            post = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE action = 'identity_mapping_viewed'"
+                )
+            )
+            post_count = post.scalar_one()
+        assert post_count == pre_count + 1
 
 
