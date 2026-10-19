@@ -776,3 +776,61 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION submit_stage2_scores(INT, NUMERIC, NUMERIC, NUMERIC, NUMERIC) TO judge_role;
+
+
+-- ----------------------------------------------------------------------------
+-- 5. CANDIDATE VERDICT
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fn_get_candidate_verdict()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_user_id INT := current_user_id();
+    v_is_disq BOOLEAN;
+    v_dq_reason TEXT;
+    v_submission_id INT;
+    v_fc_decision TEXT;
+    v_fc_reason TEXT;
+BEGIN
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'Unauthorized: candidate identity required.';
+    END IF;
+
+    SELECT c.is_disqualified, c.disqualification_reason, s.id
+    INTO v_is_disq, v_dq_reason, v_submission_id
+    FROM candidates c
+    JOIN submissions s ON s.candidate_id = c.id
+    WHERE c.id = v_user_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Candidate or submission not found.';
+    END IF;
+
+    IF v_is_disq THEN
+        RETURN jsonb_build_object(
+            'status', 'disqualified',
+            'reason', COALESCE(v_dq_reason, 'Disqualified by administration.')
+        );
+    END IF;
+
+    SELECT decision, reason INTO v_fc_decision, v_fc_reason
+    FROM finalist_checks WHERE submission_id = v_submission_id;
+
+    IF v_fc_decision IS NULL THEN
+        RETURN jsonb_build_object('status', 'not_selected');
+    ELSIF v_fc_decision = 'approved' THEN
+        RETURN jsonb_build_object('status', 'qualified');
+    ELSE
+        RETURN jsonb_build_object(
+            'status', 'disqualified',
+            'reason', COALESCE(v_fc_reason, 'Finalist verification failed.')
+        );
+    END IF;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION fn_get_candidate_verdict() TO candidate_role, admin_role;

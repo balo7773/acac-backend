@@ -1649,3 +1649,132 @@ async def test_p2_fix_4_phase_transition_guards():
         assert r.status_code == 403, r.text
         assert "none (terminal)" in r.json()["detail"]
 
+@pytest.mark.asyncio
+async def test_p2_fix_5_candidate_verdict_endpoint(tmp_path, monkeypatch):
+    """2.9c: candidate verdict endpoint.
+    - Pre-publication phase -> pending
+    - Finalist approved -> qualified
+    - No finalist row -> not_selected
+    - Finalist rejected -> disqualified + reason
+    - Direct candidate DQ -> disqualified + reason
+    - Non-candidate role -> 403
+    """
+    monkeypatch.setattr(config.settings, "UPLOAD_DIR", str(tmp_path))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            adm_id = (await session.execute(
+                text("SELECT id FROM admins WHERE username = 'chief_admin'")
+            )).scalar_one()
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'pre_launch' WHERE id = 1")
+            )
+
+        tokens, sub_ids = {}, {}
+        for label in ("qualified", "not_selected", "rejected", "disqualified"):
+            sfx = uuid.uuid4().hex[:8]
+            phone = f"+234{uuid.uuid4().int % 10**9:09d}"
+            reg = await client.post(
+                "/api/auth/register",
+                json={
+                    "full_name": f"{label.replace('_', ' ').title()} Cand {sfx}",
+                    "matric_number": f"AFIT/VD/{sfx}",
+                    "whatsapp_number": phone,
+                    "linkedin_url": "https://linkedin.com/in/vd",
+                    "password": "Password123!",
+                },
+            )
+            assert reg.status_code == 201, reg.text
+            tokens[label] = _extract_cookie_val(reg)
+            sub_ids[label] = reg.json()["submission_id"]
+
+        # Phase gate: pre_launch -> pending
+        r = await client.get(
+            "/api/candidate/verdict",
+            headers={"Authorization": f"Bearer {tokens['qualified']}"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "pending"
+
+        # Move to results_published + set up each verdict
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'results_published' WHERE id = 1")
+            )
+            await session.execute(
+                text("INSERT INTO finalist_checks (submission_id, admin_id, decision, reason) "
+                     "VALUES (:sid, :aid, 'approved', NULL)"),
+                {"sid": sub_ids["qualified"], "aid": adm_id},
+            )
+            await session.execute(
+                text("INSERT INTO finalist_checks (submission_id, admin_id, decision, reason) "
+                     "VALUES (:sid, :aid, 'rejected', 'Matriculation mismatch')"),
+                {"sid": sub_ids["rejected"], "aid": adm_id},
+            )
+            await session.execute(
+                text("UPDATE candidates SET is_disqualified = TRUE, "
+                     "disqualification_reason = 'Deadline violation' "
+                     "WHERE id = (SELECT candidate_id FROM submissions WHERE id = :sid)"),
+                {"sid": sub_ids["disqualified"]},
+            )
+
+        expected = {
+            "qualified": "qualified",
+            "not_selected": "not_selected",
+            "rejected": "disqualified",
+            "disqualified": "disqualified",
+        }
+        for label, exp_status in expected.items():
+            r = await client.get(
+                "/api/candidate/verdict",
+                headers={"Authorization": f"Bearer {tokens[label]}"},
+            )
+            assert r.status_code == 200, f"{label}: {r.status_code} {r.text}"
+            assert r.json()["status"] == exp_status, f"{label}: got {r.json()}"
+
+        r = await client.get(
+            "/api/candidate/verdict",
+            headers={"Authorization": f"Bearer {tokens['disqualified']}"},
+        )
+        assert "Deadline" in r.json()["reason"]
+
+        r = await client.get(
+            "/api/candidate/verdict",
+            headers={"Authorization": f"Bearer {tokens['rejected']}"},
+        )
+        assert "Matriculation" in r.json()["reason"]
+
+        # Non-candidate role -> 403
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+        j_uname = f"verdict_j_{uuid.uuid4().hex[:6]}"
+        await client.post(
+            "/api/admin/judges",
+            json={"username": j_uname, "password": "JudgeP2026!", "judge_type": "internal", "mask_avatar": "mask_owl"},
+            headers=adm_headers,
+        )
+        j_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": j_uname, "password": "JudgeP2026!", "role": "judge"},
+        )
+        assert j_login.status_code == 200
+        j_tok = _extract_cookie_val(j_login)
+        r = await client.get(
+            "/api/candidate/verdict",
+            headers={"Authorization": f"Bearer {j_tok}"},
+        )
+        assert r.status_code == 403
+

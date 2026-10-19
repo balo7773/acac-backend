@@ -6,7 +6,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from app.core.security import get_candidate_context
+from app.core.database import get_rls_session
+from app.core.security import get_candidate_context, get_current_claims
 from app.services.pdf_service import count_words, normalize_canonical_text, process_and_store_pdf
 
 router = APIRouter(prefix="/api/candidate", tags=["candidate"])
@@ -437,3 +438,26 @@ async def submit_defense(payload: DefenseTextRequest, ctx=Depends(get_candidate_
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e.orig))
 
     return {"submission_id": cfg.submission_id, "outcome": outcome, "word_count": words}
+
+@router.get("/verdict")
+async def get_verdict(claims: dict = Depends(get_current_claims)):
+    """Return the candidate's verdict: qualified / not_selected / disqualified / pending.
+    No scores or ranks exposed. Only meaningful once results are published.
+    This endpoint deliberately bypasses get_candidate_context so that disqualified
+    candidates can still see their status and reason."""
+    if claims["role"] != "candidate":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Candidate access required.",
+        )
+    async with get_rls_session("candidate_role", claims["user_id"]) as session:
+        phase_res = await session.execute(
+            text("SELECT current_phase FROM competition_state WHERE id = 1")
+        )
+        phase = phase_res.scalar_one()
+        if phase not in ("results_published", "stage_2_live", "completed"):
+            return {"status": "pending"}
+
+        res = await session.execute(text("SELECT fn_get_candidate_verdict()"))
+        return res.scalar_one()
+
