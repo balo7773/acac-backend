@@ -22,4 +22,5 @@ async def reset_competition_phase():
             )
         )
         await session.execute(text("DELETE FROM login_attempts"))
+        await session.execute(text("DELETE FROM ai_jobs"))
     yield
