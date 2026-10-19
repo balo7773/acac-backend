@@ -1778,3 +1778,151 @@ async def test_p2_fix_5_candidate_verdict_endpoint(tmp_path, monkeypatch):
         )
         assert r.status_code == 403
 
+@pytest.mark.asyncio
+async def test_p2_fix_6_judge_toggle_with_guarded_recompute():
+    """Endpoint 2/8: POST /api/admin/judges/{id}/active
+    Behavior:
+    - Deactivate without reason -> 400
+    - Non-existent judge -> 404
+    - Deactivate at stage_1_review -> recomputed=True; judge_deactivated audit row
+    - deactivated_at / deactivation_reason set
+    - Reactivate -> recomputed=True; judge_reactivated audit row; fields cleared
+    - Deactivate at results_published -> recomputed=False; warning returned; judge IS deactivated
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        sfx = uuid.uuid4().hex[:6]
+        j_uname = f"toggle_j_{sfx}"
+        create_r = await client.post(
+            "/api/admin/judges",
+            json={
+                "username": j_uname,
+                "password": "JudgeP2026!",
+                "judge_type": "internal",
+                "mask_avatar": "mask_owl",
+            },
+            headers=adm_headers,
+        )
+        assert create_r.status_code == 201, create_r.text
+        judge_id = create_r.json()["id"]
+
+        # 404 for non-existent judge
+        r = await client.post(
+            "/api/admin/judges/999999/active",
+            json={"is_active": False, "reason": "test"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 404, r.text
+
+        # 400 for deactivation without reason
+        r = await client.post(
+            f"/api/admin/judges/{judge_id}/active",
+            json={"is_active": False, "reason": ""},
+            headers=adm_headers,
+        )
+        assert r.status_code == 400, r.text
+        assert "reason is required" in r.json()["detail"].lower()
+
+        # Phase -> stage_1_review (direct SQL bypasses phase guard; guard tested elsewhere)
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_1_review' WHERE id = 1")
+            )
+
+        # Deactivate -> recomputed=True, no warning
+        r = await client.post(
+            f"/api/admin/judges/{judge_id}/active",
+            json={"is_active": False, "reason": "Judge unavailable"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["is_active"] is False
+        assert body["recomputed"] is True
+        assert body["warning"] is None
+
+        # DB: deactivated_at set, reason stored, audit row exists
+        async with get_rls_session("admin_role") as session:
+            row = (await session.execute(
+                text("SELECT is_active, deactivated_at, deactivation_reason "
+                     "FROM judges WHERE id = :jid"),
+                {"jid": judge_id},
+            )).mappings().one()
+            assert row["is_active"] is False
+            assert row["deactivated_at"] is not None
+            assert row["deactivation_reason"] == "Judge unavailable"
+
+            audit_action = (await session.execute(
+                text("SELECT action FROM audit_log "
+                     "WHERE action = 'judge_deactivated' AND target_type = 'judge' "
+                     "AND target_id = :jid ORDER BY id DESC LIMIT 1"),
+                {"jid": judge_id},
+            )).scalar_one_or_none()
+            assert audit_action == "judge_deactivated"
+
+        # Reactivate -> recomputed=True, fields cleared
+        r = await client.post(
+            f"/api/admin/judges/{judge_id}/active",
+            json={"is_active": True},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["is_active"] is True
+        assert body["recomputed"] is True
+
+        async with get_rls_session("admin_role") as session:
+            row = (await session.execute(
+                text("SELECT is_active, deactivated_at, deactivation_reason "
+                     "FROM judges WHERE id = :jid"),
+                {"jid": judge_id},
+            )).mappings().one()
+            assert row["is_active"] is True
+            assert row["deactivated_at"] is None
+            assert row["deactivation_reason"] is None
+
+        # Phase -> results_published
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'results_published' WHERE id = 1")
+            )
+
+        # Deactivate post-publication -> recomputed=False, warning present, judge IS deactivated
+        r = await client.post(
+            f"/api/admin/judges/{judge_id}/active",
+            json={"is_active": False, "reason": "Post-publication check"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["is_active"] is False
+        assert body["recomputed"] is False
+        assert body["warning"] is not None
+        assert "results_published" in body["warning"]
+
+        async with get_rls_session("admin_role") as session:
+            row = (await session.execute(
+                text("SELECT is_active, deactivation_reason FROM judges WHERE id = :jid"),
+                {"jid": judge_id},
+            )).mappings().one()
+            assert row["is_active"] is False
+            assert row["deactivation_reason"] == "Post-publication check"
+

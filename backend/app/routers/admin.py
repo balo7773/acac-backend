@@ -138,6 +138,97 @@ async def create_judge(payload: CreateJudgeRequest, ctx=Depends(get_admin_contex
     return dict(row)
 
 
+class ToggleJudgeRequest(BaseModel):
+    is_active: bool
+    reason: Optional[str] = None
+
+
+@router.post("/judges/{judge_id}/active")
+async def toggle_judge_active(
+    judge_id: int,
+    payload: ToggleJudgeRequest,
+    ctx=Depends(get_admin_context),
+):
+    admin_id, session = ctx
+
+    # Require reason on deactivation
+    if not payload.is_active and (not payload.reason or not payload.reason.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A non-empty reason is required when deactivating a judge.",
+        )
+
+    exist = await session.execute(
+        text("SELECT id FROM judges WHERE id = :jid"),
+        {"jid": judge_id},
+    )
+    if exist.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Judge {judge_id} not found.",
+        )
+
+    if payload.is_active:
+        await session.execute(
+            text(
+                "UPDATE judges SET is_active = TRUE, deactivated_at = NULL, "
+                "deactivation_reason = NULL WHERE id = :jid"
+            ),
+            {"jid": judge_id},
+        )
+        action = "judge_reactivated"
+    else:
+        await session.execute(
+            text(
+                "UPDATE judges SET is_active = FALSE, deactivated_at = NOW(), "
+                "deactivation_reason = :reason WHERE id = :jid"
+            ),
+            {"jid": judge_id, "reason": payload.reason.strip()},
+        )
+        action = "judge_deactivated"
+
+    await session.execute(
+        text(
+            "INSERT INTO audit_log (actor_role, actor_id, action, target_type, target_id, details) "
+            "VALUES ('admin', :aid, :action, 'judge', :jid, CAST(:det AS jsonb))"
+        ),
+        {
+            "aid": admin_id,
+            "action": action,
+            "jid": judge_id,
+            "det": json.dumps({
+                "is_active": payload.is_active,
+                "reason": payload.reason,
+            }),
+        },
+    )
+
+    phase_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    phase = phase_res.scalar_one()
+
+    recompute_phases = ("stage_1_grading", "stage_1_review", "finalist_check")
+    recomputed = False
+    warning = None
+    if phase in recompute_phases:
+        await session.execute(text("SELECT compute_stage1_results()"))
+        recomputed = True
+    else:
+        warning = (
+            f"Judge {'reactivated' if payload.is_active else 'deactivated'}; "
+            f"leaderboard NOT recomputed (phase='{phase}'). "
+            f"Call /compute-stage1 explicitly if you intend to change scores."
+        )
+
+    return {
+        "judge_id": judge_id,
+        "is_active": payload.is_active,
+        "recomputed": recomputed,
+        "warning": warning,
+    }
+
+
 @router.post("/compute-stage1")
 async def trigger_stage1_computation(ctx=Depends(get_admin_context)):
     admin_id, session = ctx
