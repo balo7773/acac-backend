@@ -107,6 +107,82 @@ async def update_competition_phase(payload: PhaseUpdateRequest, ctx=Depends(get_
     return {"current_phase": payload.new_phase}
 
 
+class StartStage1Request(BaseModel):
+    duration_hours: float = Field(..., gt=0, le=720)
+
+
+@router.post("/stage-1/start")
+async def start_stage_1(
+    payload: StartStage1Request,
+    ctx=Depends(get_admin_context),
+):
+    admin_id, session = ctx
+
+    # Phase guard: must be pre_launch
+    cur_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    current_phase = cur_res.scalar_one()
+    if current_phase != "pre_launch":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Cannot start Stage 1 from '{current_phase}'. "
+                f"Stage 1 can only be started from 'pre_launch'."
+            ),
+        )
+
+    # Read window_length_seconds from the active settings row
+    cfg_res = await session.execute(
+        text("SELECT window_length_seconds FROM settings WHERE is_active = TRUE")
+    )
+    window_length_seconds = cfg_res.scalar_one()
+
+    duration_secs = int(payload.duration_hours * 3600)
+    closing_secs = duration_secs + window_length_seconds
+
+    update_res = await session.execute(
+        text(
+            """
+            UPDATE competition_state
+            SET current_phase = 'stage_1_submitting',
+                stage_1_submission_deadline = NOW() + make_interval(secs => :dur_secs),
+                stage_1_conclusion_closing_time = NOW() + make_interval(secs => :closing_secs)
+            WHERE id = 1
+            RETURNING stage_1_submission_deadline, stage_1_conclusion_closing_time
+            """
+        ),
+        {"dur_secs": duration_secs, "closing_secs": closing_secs},
+    )
+    row = update_res.mappings().one()
+    deadline = row["stage_1_submission_deadline"]
+    closing_time = row["stage_1_conclusion_closing_time"]
+
+    await session.execute(
+        text(
+            "INSERT INTO audit_log (actor_role, actor_id, action, target_type, target_id, details) "
+            "VALUES ('admin', :aid, 'stage_1_started', 'competition_state', 1, CAST(:det AS jsonb))"
+        ),
+        {
+            "aid": admin_id,
+            "det": json.dumps({
+                "duration_hours": payload.duration_hours,
+                "duration_secs": duration_secs,
+                "window_length_seconds": window_length_seconds,
+                "deadline": deadline.isoformat() if deadline else None,
+                "closing_time": closing_time.isoformat() if closing_time else None,
+            }),
+        },
+    )
+
+    return {
+        "current_phase": "stage_1_submitting",
+        "duration_hours": payload.duration_hours,
+        "deadline": deadline,
+        "closing_time": closing_time,
+    }
+
+
 @router.post("/judges", status_code=status.HTTP_201_CREATED)
 async def create_judge(payload: CreateJudgeRequest, ctx=Depends(get_admin_context)):
     admin_id, session = ctx

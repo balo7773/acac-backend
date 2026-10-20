@@ -1926,3 +1926,110 @@ async def test_p2_fix_6_judge_toggle_with_guarded_recompute():
             assert row["is_active"] is False
             assert row["deactivation_reason"] == "Post-publication check"
 
+@pytest.mark.asyncio
+async def test_p2_fix_7_stage_1_start_with_duration():
+    """Endpoint 3/8: POST /api/admin/stage-1/start
+    - Sets phase to stage_1_submitting
+    - Computes deadline = NOW() + duration_hours
+    - Computes closing_time = deadline + window_length_seconds
+    - Writes audit_log row
+    - Second call (from stage_1_submitting) -> 403
+    """
+    import datetime as dt
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'pre_launch', "
+                     "stage_1_submission_deadline = NULL, "
+                     "stage_1_conclusion_closing_time = NULL WHERE id = 1")
+            )
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # Read active window_length_seconds from settings
+        async with get_rls_session("admin_role") as session:
+            win_secs = (await session.execute(
+                text("SELECT window_length_seconds FROM settings WHERE is_active = TRUE")
+            )).scalar_one()
+        assert win_secs == 600
+
+        # Start Stage 1 with 0.5 hours = 1800 seconds
+        t_before = dt.datetime.now(dt.timezone.utc)
+        r = await client.post(
+            "/api/admin/stage-1/start",
+            json={"duration_hours": 0.5},
+            headers=adm_headers,
+        )
+        t_after = dt.datetime.now(dt.timezone.utc)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["current_phase"] == "stage_1_submitting"
+        assert body["duration_hours"] == 0.5
+
+        # Parse response timestamps
+        deadline = dt.datetime.fromisoformat(body["deadline"].replace("Z", "+00:00"))
+        closing = dt.datetime.fromisoformat(body["closing_time"].replace("Z", "+00:00"))
+
+        # deadline should be ~1800 seconds from the call (tolerance ±5s)
+        assert deadline >= t_before + dt.timedelta(seconds=1795), f"deadline too early: {deadline}"
+        assert deadline <= t_after + dt.timedelta(seconds=1805), f"deadline too late: {deadline}"
+
+        # closing_time - deadline should be exactly window_length_seconds
+        delta = (closing - deadline).total_seconds()
+        assert abs(delta - win_secs) < 1.0, f"closing offset off by {delta - win_secs}s"
+
+        # DB state
+        async with get_rls_session("admin_role") as session:
+            db_row = (await session.execute(
+                text("SELECT current_phase, stage_1_submission_deadline, "
+                     "stage_1_conclusion_closing_time FROM competition_state WHERE id = 1")
+            )).mappings().one()
+            assert db_row["current_phase"] == "stage_1_submitting"
+            assert db_row["stage_1_submission_deadline"] is not None
+            assert db_row["stage_1_conclusion_closing_time"] is not None
+
+            # Audit
+            audit_action = (await session.execute(
+                text("SELECT action FROM audit_log WHERE action = 'stage_1_started' "
+                     "ORDER BY id DESC LIMIT 1")
+            )).scalar_one_or_none()
+            assert audit_action == "stage_1_started"
+
+        # Second call from stage_1_submitting must 403
+        r = await client.post(
+            "/api/admin/stage-1/start",
+            json={"duration_hours": 1.0},
+            headers=adm_headers,
+        )
+        assert r.status_code == 403, r.text
+        assert "Cannot start Stage 1" in r.json()["detail"]
+        assert "pre_launch" in r.json()["detail"]
+
+        # Invalid duration (0) must be rejected by Pydantic
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'pre_launch' WHERE id = 1")
+            )
+        r = await client.post(
+            "/api/admin/stage-1/start",
+            json={"duration_hours": 0},
+            headers=adm_headers,
+        )
+        assert r.status_code == 422, r.text
+

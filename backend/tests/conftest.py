@@ -18,7 +18,9 @@ async def reset_competition_phase():
     async with get_rls_session("admin_role") as session:
         await session.execute(
             text(
-                "UPDATE competition_state SET current_phase = 'pre_launch' WHERE id = 1"
+                "UPDATE competition_state SET current_phase = 'pre_launch', "
+                "stage_1_submission_deadline = NULL, "
+                "stage_1_conclusion_closing_time = NULL WHERE id = 1"
             )
         )
         await session.execute(text("DELETE FROM login_attempts"))
