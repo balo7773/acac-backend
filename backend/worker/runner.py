@@ -13,6 +13,9 @@ from app.core.database import get_rls_session
 from app.routers.candidates import FALLBACK_QUESTIONS
 from app.core.config import settings
 from app.services.ai.client import call_deepseek, call_gemma, AIClientError
+from app.services.ai.prompts.job_a_templates import (
+    JOB_A_TEMPLATES, JOB_A_PERSONALIZE_PROMPT, choose_template, plain_template
+)
 from app.services.pdf_service import locate_verbatim_quote
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -168,8 +171,11 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
         if not row:
             return {"status": "skipped_no_submission"}
 
-        idx = ((row.template_id or 1) - 1) % len(FALLBACK_QUESTIONS)
-        q_text = FALLBACK_QUESTIONS[idx]
+        # Choose template deterministically from submission_id
+        tid, tstr = choose_template(sid)
+        q_text, q_source, is_fb = await _generate_question_a(
+            sid, row.canonical_text, tid, tstr
+        )
         if row.outcome == "preparing":
             await session.execute(
                 text(
@@ -180,8 +186,10 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
                             THEN 'auto_zero'
                             ELSE 'in_progress'
                         END,
-                        question_text = COALESCE(cw.question_text, :q),
-                        question_source = COALESCE(cw.question_source, 'deepseek'),
+                        question_text = :q,
+                        question_source = :qsrc,
+                        is_fallback_wording = :is_fb,
+                        template_id = :tid,
                         question_delivered_at = NOW(),
                         window_ends_at = CASE
                             WHEN cs.stage_1_conclusion_closing_time IS NOT NULL
@@ -194,7 +202,7 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
                       AND cw.submission_id = :sid AND cw.outcome = 'preparing'
                     """
                 ),
-                {"q": q_text, "sid": sid},
+                {"q": q_text, "qsrc": q_source, "is_fb": is_fb, "tid": tid, "sid": sid},
             )
         return {"question_prepared": q_text}
 
@@ -585,6 +593,33 @@ async def run_worker_forever(poll_interval: float = 2.0):
 
 if __name__ == "__main__":
     asyncio.run(run_worker_forever())
+
+async def _generate_question_a(sid: int, canonical_text: str, template_id: int, template_str: str) -> tuple[str, str, bool]:
+    """Return (question_text, question_source, is_fallback_wording).
+    Tries real personalization first; falls back to plain template on any failure."""
+    if settings.AI_MODE != "real":
+        return plain_template(template_str), "backup", True
+
+    prompt = JOB_A_PERSONALIZE_PROMPT.format(template=template_str, essay=canonical_text)
+    try:
+        result = await call_deepseek(prompt)
+        parsed = result["parsed"]
+        essay_quote = (parsed.get("essay_quote") or "").strip()
+        question = (parsed.get("question") or "").strip()
+        if not essay_quote or not question:
+            raise AIClientError("empty essay_quote or question", category="PARSE")
+        # Verify quote appears verbatim in essay
+        essay_norm = " ".join(canonical_text.split())
+        quote_norm = " ".join(essay_quote.split())
+        if len(quote_norm) < 40 or quote_norm not in essay_norm:
+            raise AIClientError(
+                f"quote not verbatim in essay (len={len(quote_norm)})", category="PARSE"
+            )
+        return question, "deepseek", False
+    except AIClientError as e:
+        logger.warning("Job A personalization failed for sid=%s: %s", sid, e)
+        return plain_template(template_str), "backup", True
+
 
 async def _generate_real_eval(model_name: str, run_id: int, canonical_text: str) -> dict:
     """Real LLM evaluation. Same shape as the stub."""

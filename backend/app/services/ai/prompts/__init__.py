@@ -1,0 +1,1 @@
+"""Job A template prompts."""
