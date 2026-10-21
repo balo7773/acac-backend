@@ -943,3 +943,84 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION fn_list_stage2_finalists() TO judge_role;
+
+-- ----------------------------------------------------------------------------
+-- 8. STAGE 2 PEER VIEW (per-judge, quorum-gated, requires own score)
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fn_get_stage2_view(p_submission_id INT)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_judge_id INT := current_user_id();
+    v_quorum INT;
+    v_scored_count INT;
+    v_my_scored BOOLEAN;
+    v_revealed BOOLEAN := FALSE;
+    v_peers JSONB;
+BEGIN
+    IF v_judge_id IS NULL THEN
+        RAISE EXCEPTION 'Unauthorized: Judge identity required.';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM judges WHERE id = v_judge_id AND is_active = TRUE) THEN
+        RAISE EXCEPTION 'Judge is not active.';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM finalists f
+        JOIN finalist_checks fc ON fc.submission_id = f.submission_id
+        WHERE f.submission_id = p_submission_id AND fc.decision = 'approved'
+    ) THEN
+        RAISE EXCEPTION 'Submission is not an approved finalist.';
+    END IF;
+
+    SELECT min_active_judges INTO v_quorum FROM settings WHERE is_active = TRUE;
+
+    SELECT EXISTS(
+        SELECT 1 FROM stage2_scores
+        WHERE submission_id = p_submission_id AND judge_id = v_judge_id
+    ) INTO v_my_scored;
+
+    SELECT COUNT(DISTINCT judge_id) INTO v_scored_count
+    FROM stage2_scores WHERE submission_id = p_submission_id;
+
+    IF v_scored_count >= v_quorum AND v_my_scored THEN
+        v_revealed := TRUE;
+        SELECT jsonb_agg(jsonb_build_object(
+            'mask_avatar', j.mask_avatar,
+            'c1', s2.c1,
+            'c2', s2.c2,
+            'c3', s2.c3,
+            'c4', s2.c4
+        ) ORDER BY j.mask_avatar)
+        INTO v_peers
+        FROM (
+            SELECT judge_id,
+                   MAX(CASE WHEN criterion_key='c1' THEN raw_score END) AS c1,
+                   MAX(CASE WHEN criterion_key='c2' THEN raw_score END) AS c2,
+                   MAX(CASE WHEN criterion_key='c3' THEN raw_score END) AS c3,
+                   MAX(CASE WHEN criterion_key='c4' THEN raw_score END) AS c4
+            FROM stage2_scores
+            WHERE submission_id = p_submission_id
+            GROUP BY judge_id
+        ) s2
+        JOIN judges j ON j.id = s2.judge_id
+        WHERE s2.judge_id <> v_judge_id;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'submission_id', p_submission_id,
+        'revealed', v_revealed,
+        'my_score_recorded', v_my_scored,
+        'scored_count', v_scored_count,
+        'quorum', v_quorum,
+        'peers', COALESCE(v_peers, '[]'::jsonb)
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION fn_get_stage2_view(INT) TO judge_role;

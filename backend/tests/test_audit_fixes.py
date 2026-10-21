@@ -2643,3 +2643,233 @@ async def test_p2_fix_11_stage2_finalists_list():
         r = await client.get("/api/judge/stage2/finalists", headers=adm_headers)
         assert r.status_code == 403, r.text
 
+@pytest.mark.asyncio
+async def test_p2_fix_12_stage2_peer_view():
+    """Endpoint 8/8: GET /api/judge/stage2/{submission_id}/peers
+    - Wrong phase -> 403
+    - Wrong role -> 403
+    - Non-finalist submission -> 400
+    - Before quorum (2 scored) -> revealed=False
+    - After quorum + own score (3 scored) -> revealed=True, peers = other 2
+    - Judge who hasn't scored -> revealed=False even if quorum met (guard)
+    - Score values correct; only masks, no identity
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        # Setup admin + phase
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_1_submitting' WHERE id = 1")
+            )
+            adm_id = (await session.execute(
+                text("SELECT id FROM admins WHERE username = 'chief_admin'")
+            )).scalar_one()
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # 4 judges: 3 internal + 1 external, with distinct masks
+        j_suffix = uuid.uuid4().hex[:6]
+        judge_specs = [
+            ("j1", "internal", "mask_owl"),
+            ("j2", "internal", "mask_falcon"),
+            ("j3", "internal", "mask_lion"),
+            ("j4", "external", "mask_panther"),
+        ]
+        judge_tokens = {}
+        for label, jtype, mask in judge_specs:
+            uname = f"st2p_{label}_{j_suffix}"
+            r = await client.post(
+                "/api/admin/judges",
+                json={"username": uname, "password": "JudgeP2026!",
+                      "judge_type": jtype, "mask_avatar": mask},
+                headers=adm_headers,
+            )
+            assert r.status_code == 201, r.text
+            lr = await client.post(
+                "/api/auth/login",
+                json={"identifier": uname, "password": "JudgeP2026!", "role": "judge"},
+            )
+            assert lr.status_code == 200, lr.text
+            judge_tokens[label] = _extract_cookie_val(lr)
+
+        j_headers = {label: {"Authorization": f"Bearer {tok}"} for label, tok in judge_tokens.items()}
+
+        # 2 candidates: one approved finalist, one non-finalist
+        sub_ids = {}
+        for label in ("finalist", "nonfinalist"):
+            sfx = uuid.uuid4().hex[:6]
+            reg = await client.post(
+                "/api/auth/register",
+                json={
+                    "full_name": f"Cand {label} {sfx}",
+                    "matric_number": f"AFIT/ST2P/{sfx}",
+                    "whatsapp_number": f"+234{uuid.uuid4().int % 10**9:09d}",
+                    "linkedin_url": "https://linkedin.com/in/st2p",
+                    "password": "Password123!",
+                },
+            )
+            assert reg.status_code == 201, reg.text
+            sub_ids[label] = reg.json()["submission_id"]
+
+        # Setup: finalist row + approved check
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO finalists (submission_id, stage1_rank, composite_score, admitted_by, status) "
+                     "VALUES (:sid, 1, 80, 'rank', 'pending_check')"),
+                {"sid": sub_ids["finalist"]},
+            )
+            await session.execute(
+                text("INSERT INTO finalist_checks (submission_id, admin_id, decision, reason) "
+                     "VALUES (:sid, :aid, 'approved', NULL)"),
+                {"sid": sub_ids["finalist"], "aid": adm_id},
+            )
+
+        # Wrong phase -> 403
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['finalist']}/peers",
+            headers=j_headers["j1"],
+        )
+        assert r.status_code == 403, r.text
+        assert "stage_2_live" in r.json()["detail"]
+
+        # Move to stage_2_live
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_2_live' WHERE id = 1")
+            )
+
+        # Non-finalist submission -> 400
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['nonfinalist']}/peers",
+            headers=j_headers["j1"],
+        )
+        assert r.status_code == 400, r.text
+        assert "not an approved finalist" in r.json()["detail"]
+
+        # Before anyone scored: revealed=False, scored_count=0, my_score_recorded=False
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['finalist']}/peers",
+            headers=j_headers["j1"],
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["revealed"] is False
+        assert body["my_score_recorded"] is False
+        assert body["scored_count"] == 0
+        assert body["peers"] == []
+        assert body["quorum"] == 3
+
+        # J1 scores -> still revealed=False (only 1 scored)
+        r = await client.post(
+            f"/api/judge/stage2/{sub_ids['finalist']}/score",
+            json={"c1": 80, "c2": 75, "c3": 85, "c4": 70},
+            headers=j_headers["j1"],
+        )
+        assert r.status_code == 200, r.text
+
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['finalist']}/peers",
+            headers=j_headers["j1"],
+        )
+        body = r.json()
+        assert body["revealed"] is False
+        assert body["scored_count"] == 1
+        assert body["my_score_recorded"] is True
+
+        # J2 scores -> still 2 < 3, revealed=False
+        r = await client.post(
+            f"/api/judge/stage2/{sub_ids['finalist']}/score",
+            json={"c1": 70, "c2": 80, "c3": 75, "c4": 85},
+            headers=j_headers["j2"],
+        )
+        assert r.status_code == 200
+
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['finalist']}/peers",
+            headers=j_headers["j1"],
+        )
+        body = r.json()
+        assert body["revealed"] is False
+        assert body["scored_count"] == 2
+
+        # J3 scores -> 3 scored (quorum met) -> J1 (who has scored) can see peers
+        r = await client.post(
+            f"/api/judge/stage2/{sub_ids['finalist']}/score",
+            json={"c1": 90, "c2": 85, "c3": 80, "c4": 95},
+            headers=j_headers["j3"],
+        )
+        assert r.status_code == 200
+
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['finalist']}/peers",
+            headers=j_headers["j1"],
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["revealed"] is True
+        assert body["scored_count"] == 3
+        assert body["my_score_recorded"] is True
+        assert len(body["peers"]) == 2, f"Expected 2 peers (excluding self), got {len(body['peers'])}"
+
+        # Verify peer fields: masks + scores, no identity
+        for peer in body["peers"]:
+            assert set(peer.keys()) == {"mask_avatar", "c1", "c2", "c3", "c4"}, \
+                f"Unexpected fields: {peer.keys()}"
+            assert peer["mask_avatar"] in ("mask_falcon", "mask_lion")
+        # J2 (falcon): c1=70, c2=80, c3=75, c4=85
+        # J3 (lion):   c1=90, c2=85, c3=80, c4=95
+        by_mask = {p["mask_avatar"]: p for p in body["peers"]}
+        assert float(by_mask["mask_falcon"]["c1"]) == 70
+        assert float(by_mask["mask_lion"]["c1"]) == 90
+
+        # J4 hasn't scored -> revealed=False despite quorum met (guard)
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['finalist']}/peers",
+            headers=j_headers["j4"],
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["revealed"] is False
+        assert body["my_score_recorded"] is False
+        assert body["scored_count"] == 3  # quorum still met
+        assert body["peers"] == []
+
+        # J4 scores -> now sees 3 peers
+        r = await client.post(
+            f"/api/judge/stage2/{sub_ids['finalist']}/score",
+            json={"c1": 85, "c2": 90, "c3": 75, "c4": 80},
+            headers=j_headers["j4"],
+        )
+        assert r.status_code == 200
+
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['finalist']}/peers",
+            headers=j_headers["j4"],
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["revealed"] is True
+        assert body["scored_count"] == 4
+        assert len(body["peers"]) == 3
+
+        # Admin hitting judge route -> 403
+        r = await client.get(
+            f"/api/judge/stage2/{sub_ids['finalist']}/peers",
+            headers=adm_headers,
+        )
+        assert r.status_code == 403, r.text
+

@@ -349,6 +349,41 @@ async def list_stage2_finalists(ctx=Depends(get_judge_context)):
     return {"finalists": finalists, "count": len(finalists)}
 
 
+@router.get("/stage2/{submission_id}/peers")
+async def get_stage2_peers(
+    submission_id: int,
+    ctx=Depends(get_judge_context),
+):
+    """Peer scores for a Stage 2 finalist. Revealed only when (a) quorum is met
+    and (b) the requesting judge has submitted their own score. Returns mask
+    labels only, never identity."""
+    judge_id, session = ctx
+
+    phase_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    phase = phase_res.scalar_one()
+    if phase not in ("stage_2_live", "completed"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Stage 2 peer view only available in 'stage_2_live' or 'completed' "
+                f"(current: '{phase}')."
+            ),
+        )
+
+    try:
+        res = await session.execute(
+            text("SELECT fn_get_stage2_view(:sid)"),
+            {"sid": submission_id},
+        )
+        result = res.scalar_one()
+    except DBAPIError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e.orig))
+
+    return result
+
+
 @router.post("/stage2/{submission_id}/score")
 async def submit_stage2_live_score(
     submission_id: int,
