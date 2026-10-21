@@ -25,4 +25,7 @@ async def reset_competition_phase():
         )
         await session.execute(text("DELETE FROM login_attempts"))
         await session.execute(text("DELETE FROM ai_jobs"))
+        # Reset settings to baseline version 1 (seed)
+        await session.execute(text("UPDATE settings SET is_active = FALSE WHERE is_active = TRUE"))
+        await session.execute(text("UPDATE settings SET is_active = TRUE WHERE version = 1"))
     yield

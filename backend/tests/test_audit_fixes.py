@@ -2033,3 +2033,145 @@ async def test_p2_fix_7_stage_1_start_with_duration():
         )
         assert r.status_code == 422, r.text
 
+@pytest.mark.asyncio
+async def test_p2_fix_8_settings_versioned_update():
+    """Endpoint 4/8: PUT /api/admin/settings
+    - Single-field change creates new version, deactivates old
+    - Old row preserved (not deleted)
+    - Audit log 'settings_versioned' written
+    - Multi-field change works
+    - Empty payload -> 400
+    - Cross-field violation (min >= max) -> 400
+    - criteria_weights not summing to 1.0 -> 400
+    - Blocked during 'completed' phase -> 403
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'pre_launch' WHERE id = 1")
+            )
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # Baseline: version 1 active
+        async with get_rls_session("admin_role") as session:
+            base = (await session.execute(
+                text("SELECT version, blur_margin FROM settings WHERE is_active = TRUE")
+            )).mappings().one()
+        base_version = base["version"]
+
+        # 1. Empty payload -> 400
+        r = await client.put("/api/admin/settings", json={}, headers=adm_headers)
+        assert r.status_code == 400, r.text
+        assert "At least one setting" in r.json()["detail"]
+
+        # 2. Change blur_margin alone -> new version
+        r = await client.put(
+            "/api/admin/settings",
+            json={"blur_margin": 0.75},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["old_version"] == base_version
+        assert body["new_version"] > base_version
+        assert "blur_margin" in body["changed_fields"]
+        assert body["changed_fields"]["blur_margin"]["to"] == 0.75
+        new_version = body["new_version"]
+
+        # 3. Old version deactivated, new version active, old row preserved
+        async with get_rls_session("admin_role") as session:
+            active = (await session.execute(
+                text("SELECT version, blur_margin FROM settings WHERE is_active = TRUE")
+            )).mappings().one()
+            assert active["version"] == new_version
+            assert float(active["blur_margin"]) == 0.75
+
+            old_row = (await session.execute(
+                text("SELECT version, is_active, blur_margin FROM settings WHERE version = :v"),
+                {"v": base_version},
+            )).mappings().one()
+            assert old_row["is_active"] is False
+            assert float(old_row["blur_margin"]) == 0.5
+
+            audit_action = (await session.execute(
+                text("SELECT action FROM audit_log WHERE action = 'settings_versioned' "
+                     "ORDER BY id DESC LIMIT 1")
+            )).scalar_one_or_none()
+            assert audit_action == "settings_versioned"
+
+        # 4. Multi-field change
+        r = await client.put(
+            "/api/admin/settings",
+            json={"blur_margin": 0.6, "window_length_seconds": 900},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "blur_margin" in body["changed_fields"]
+        assert "window_length_seconds" in body["changed_fields"]
+
+        # 5. Cross-field violation: answer_word_min >= answer_word_limit
+        r = await client.put(
+            "/api/admin/settings",
+            json={"answer_word_limit": 50},
+            headers=adm_headers,
+        )
+        assert r.status_code == 400, r.text
+        assert "answer_word_min" in r.json()["detail"]
+
+        # 6. criteria_weights not summing to 1.0
+        r = await client.put(
+            "/api/admin/settings",
+            json={"criteria_weights": {"c1": 0.1, "c2": 0.1, "c3": 0.1, "c4": 0.1, "c5": 0.1}},
+            headers=adm_headers,
+        )
+        assert r.status_code == 400, r.text
+        assert "criteria_weights" in r.json()["detail"]
+
+        # 7. Completed phase blocks changes
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'completed' WHERE id = 1")
+            )
+        r = await client.put(
+            "/api/admin/settings",
+            json={"blur_margin": 0.4},
+            headers=adm_headers,
+        )
+        assert r.status_code == 403, r.text
+        assert "completed" in r.json()["detail"]
+
+        # 8. Idempotent: same value produces no version bump
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'pre_launch' WHERE id = 1")
+            )
+            cur = (await session.execute(
+                text("SELECT version, blur_margin FROM settings WHERE is_active = TRUE")
+            )).mappings().one()
+        r = await client.put(
+            "/api/admin/settings",
+            json={"blur_margin": float(cur["blur_margin"])},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["old_version"] == body["new_version"]
+        assert body["changed_fields"] == {}
+

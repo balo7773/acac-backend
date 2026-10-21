@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -105,6 +106,220 @@ async def update_competition_phase(payload: PhaseUpdateRequest, ctx=Depends(get_
     )
 
     return {"current_phase": payload.new_phase}
+
+
+class SettingsUpdateRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    weight_internal_judge: Optional[float] = Field(default=None, gt=0)
+    weight_external_judge: Optional[float] = Field(default=None, gt=0)
+    min_active_judges: Optional[int] = Field(default=None, ge=1)
+    essay_weight_pct: Optional[float] = Field(default=None, gt=0, le=100)
+    conclusion_weight_pct: Optional[float] = Field(default=None, gt=0, le=100)
+    conclusion_floor_score: Optional[float] = Field(default=None, gt=0, le=30)
+    criteria_weights: Optional[dict] = None
+    stage2_criteria_weights: Optional[dict] = None
+    stage1_overall_weight: Optional[float] = Field(default=None, gt=0, le=1)
+    stage2_overall_weight: Optional[float] = Field(default=None, gt=0, le=1)
+    top_finalists_target: Optional[int] = Field(default=None, ge=1)
+    blur_margin: Optional[float] = Field(default=None, ge=0)
+    question_word_limit: Optional[int] = Field(default=None, ge=1)
+    answer_word_min: Optional[int] = Field(default=None, ge=1)
+    answer_word_limit: Optional[int] = Field(default=None, ge=1)
+    window_length_seconds: Optional[int] = Field(default=None, ge=60)
+    grace_seconds: Optional[int] = Field(default=None, ge=0)
+    phase2_window_seconds: Optional[int] = Field(default=None, ge=60)
+    template_count: Optional[int] = Field(default=None, ge=1)
+    run_gap: Optional[float] = Field(default=None, ge=0, le=1)
+    model_gap: Optional[float] = Field(default=None, ge=0, le=1)
+    similarity_threshold: Optional[float] = Field(default=None, ge=0, le=1)
+    rubric_version: Optional[str] = Field(default=None, min_length=1, max_length=50)
+
+
+@router.put("/settings")
+async def update_settings(
+    payload: SettingsUpdateRequest,
+    ctx=Depends(get_admin_context),
+):
+    admin_id, session = ctx
+
+    # Phase guard: block post-completion (competition frozen)
+    cur_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    current_phase = cur_res.scalar_one()
+    if current_phase == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Settings cannot be changed after the competition has completed.",
+        )
+
+    updates = payload.model_dump(exclude_unset=True, exclude_none=True)
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one setting must be provided.",
+        )
+
+    # Read current active row (lock for the transaction)
+    cur_res = await session.execute(
+        text("SELECT * FROM settings WHERE is_active = TRUE FOR UPDATE")
+    )
+    current = cur_res.mappings().one()
+    old_version = current["version"]
+    merged = dict(current)
+    # NUMERIC columns come back as Decimal; cast to float for arithmetic safety
+    for _k, _v in list(merged.items()):
+        if isinstance(_v, Decimal):
+            merged[_k] = float(_v)
+
+    changed = {}
+    for key, new_val in updates.items():
+        old_val = merged.get(key)
+        if old_val != new_val:
+            changed[key] = {"from": old_val, "to": new_val}
+            merged[key] = new_val
+
+    if not changed:
+        return {
+            "old_version": old_version,
+            "new_version": old_version,
+            "changed_fields": {},
+            "message": "No changes: submitted values already match active settings.",
+        }
+
+    # Cross-field validation on the MERGED row (not the raw payload)
+    if merged["answer_word_min"] >= merged["answer_word_limit"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"answer_word_min ({merged['answer_word_min']}) must be "
+                f"less than answer_word_limit ({merged['answer_word_limit']})."
+            ),
+        )
+
+    try:
+        cw_sum = sum(float(v) for v in merged["criteria_weights"].values())
+    except (AttributeError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="criteria_weights must be a JSON object of numeric values.",
+        )
+    if abs(cw_sum - 1.0) > 0.001:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"criteria_weights must sum to 1.0 (got {cw_sum}).",
+        )
+
+    try:
+        s2_sum = sum(float(v) for v in merged["stage2_criteria_weights"].values())
+    except (AttributeError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="stage2_criteria_weights must be a JSON object of numeric values.",
+        )
+    if abs(s2_sum - 1.0) > 0.001:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"stage2_criteria_weights must sum to 1.0 (got {s2_sum}).",
+        )
+
+    pct_sum = merged["essay_weight_pct"] + merged["conclusion_weight_pct"]
+    if abs(pct_sum - 100) > 0.001:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"essay_weight_pct + conclusion_weight_pct must equal 100 (got {pct_sum}).",
+        )
+
+    overall_sum = merged["stage1_overall_weight"] + merged["stage2_overall_weight"]
+    if abs(overall_sum - 1.0) > 0.001:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"stage1_overall_weight + stage2_overall_weight must equal 1.0 (got {overall_sum}).",
+        )
+
+    # Compute new version
+    new_version = (await session.execute(
+        text("SELECT COALESCE(MAX(version), 0) + 1 FROM settings")
+    )).scalar_one()
+
+    # Deactivate old, insert new
+    await session.execute(text("UPDATE settings SET is_active = FALSE WHERE is_active = TRUE"))
+    await session.execute(
+        text("""
+            INSERT INTO settings (
+                version, is_active,
+                weight_internal_judge, weight_external_judge, min_active_judges,
+                essay_weight_pct, conclusion_weight_pct, conclusion_floor_score,
+                criteria_weights, stage2_criteria_weights,
+                stage1_overall_weight, stage2_overall_weight,
+                top_finalists_target, blur_margin,
+                question_word_limit, answer_word_min, answer_word_limit,
+                window_length_seconds, grace_seconds, phase2_window_seconds,
+                template_count, run_gap, model_gap, similarity_threshold,
+                rubric_version
+            ) VALUES (
+                :version, TRUE,
+                :w_int, :w_ext, :min_judges,
+                :essay_pct, :conc_pct, :conc_floor,
+                CAST(:cw AS jsonb), CAST(:s2cw AS jsonb),
+                :s1_overall, :s2_overall,
+                :top_target, :blur,
+                :q_limit, :a_min, :a_limit,
+                :window_len, :grace, :phase2_win,
+                :tmpl_count, :run_gap, :model_gap, :sim_thresh,
+                :rubric_ver
+            )
+        """),
+        {
+            "version": new_version,
+            "w_int": float(merged["weight_internal_judge"]),
+            "w_ext": float(merged["weight_external_judge"]),
+            "min_judges": int(merged["min_active_judges"]),
+            "essay_pct": float(merged["essay_weight_pct"]),
+            "conc_pct": float(merged["conclusion_weight_pct"]),
+            "conc_floor": float(merged["conclusion_floor_score"]),
+            "cw": json.dumps(merged["criteria_weights"]),
+            "s2cw": json.dumps(merged["stage2_criteria_weights"]),
+            "s1_overall": float(merged["stage1_overall_weight"]),
+            "s2_overall": float(merged["stage2_overall_weight"]),
+            "top_target": int(merged["top_finalists_target"]),
+            "blur": float(merged["blur_margin"]),
+            "q_limit": int(merged["question_word_limit"]),
+            "a_min": int(merged["answer_word_min"]),
+            "a_limit": int(merged["answer_word_limit"]),
+            "window_len": int(merged["window_length_seconds"]),
+            "grace": int(merged["grace_seconds"]),
+            "phase2_win": int(merged["phase2_window_seconds"]),
+            "tmpl_count": int(merged["template_count"]),
+            "run_gap": float(merged["run_gap"]),
+            "model_gap": float(merged["model_gap"]),
+            "sim_thresh": float(merged["similarity_threshold"]),
+            "rubric_ver": str(merged["rubric_version"]),
+        },
+    )
+
+    await session.execute(
+        text(
+            "INSERT INTO audit_log (actor_role, actor_id, action, target_type, target_id, details) "
+            "VALUES ('admin', :aid, 'settings_versioned', 'settings', :new_ver, CAST(:det AS jsonb))"
+        ),
+        {
+            "aid": admin_id,
+            "new_ver": new_version,
+            "det": json.dumps({
+                "old_version": old_version,
+                "new_version": new_version,
+                "changed_fields": changed,
+            }),
+        },
+    )
+
+    return {
+        "old_version": old_version,
+        "new_version": new_version,
+        "changed_fields": changed,
+    }
 
 
 class StartStage1Request(BaseModel):
