@@ -2485,3 +2485,161 @@ async def test_p2_fix_10_finalist_selection():
             count2 = (await session.execute(text("SELECT COUNT(*) FROM finalists"))).scalar_one()
             assert count2 == 6, f"After idempotent re-call: {count2} rows"
 
+@pytest.mark.asyncio
+async def test_p2_fix_11_stage2_finalists_list():
+    """Endpoint 7/8: GET /api/judge/stage2/finalists
+    - Wrong phase -> 403
+    - Wrong role (admin) -> 403
+    - Only approved finalists appear (rejected finalist + non-finalist excluded)
+    - No identity fields in response (no full_name / matric / whatsapp)
+    - has_my_score is False before scoring, True after
+    - Per-judge isolation: J2 still sees False after J1 scores the same submission
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        # Admin setup
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_1_submitting' WHERE id = 1")
+            )
+            adm_id = (await session.execute(
+                text("SELECT id FROM admins WHERE username = 'chief_admin'")
+            )).scalar_one()
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # 2 judges
+        j_suffix = uuid.uuid4().hex[:6]
+        judge_tokens = {}
+        for uname in (f"st2_j1_{j_suffix}", f"st2_j2_{j_suffix}"):
+            r = await client.post(
+                "/api/admin/judges",
+                json={
+                    "username": uname,
+                    "password": "JudgeP2026!",
+                    "judge_type": "internal",
+                    "mask_avatar": "mask_owl",
+                },
+                headers=adm_headers,
+            )
+            assert r.status_code == 201, r.text
+            lr = await client.post(
+                "/api/auth/login",
+                json={"identifier": uname, "password": "JudgeP2026!", "role": "judge"},
+            )
+            assert lr.status_code == 200, lr.text
+            judge_tokens[uname] = _extract_cookie_val(lr)
+
+        j1_h = {"Authorization": f"Bearer {judge_tokens[f'st2_j1_{j_suffix}']}"}
+        j2_h = {"Authorization": f"Bearer {judge_tokens[f'st2_j2_{j_suffix}']}"}
+
+        # 5 candidates: 3 approved finalists, 1 rejected finalist, 1 non-finalist
+        sub_ids = {}
+        for label in ("approved_a", "approved_b", "approved_c", "rejected_d", "nonfinalist_e"):
+            sfx = uuid.uuid4().hex[:6]
+            reg = await client.post(
+                "/api/auth/register",
+                json={
+                    "full_name": f"Cand {label} {sfx}",
+                    "matric_number": f"AFIT/ST2/{sfx}",
+                    "whatsapp_number": f"+234{uuid.uuid4().int % 10**9:09d}",
+                    "linkedin_url": "https://linkedin.com/in/st2",
+                    "password": "Password123!",
+                },
+            )
+            assert reg.status_code == 201, reg.text
+            sub_ids[label] = reg.json()["submission_id"]
+
+        # Setup: finalists rows + finalist_checks decisions
+        async with get_rls_session("admin_role") as session:
+            for label, rank in [
+                ("approved_a", 1), ("approved_b", 2), ("approved_c", 3), ("rejected_d", 4),
+            ]:
+                await session.execute(
+                    text("INSERT INTO finalists (submission_id, stage1_rank, composite_score, admitted_by, status) "
+                         "VALUES (:sid, :r, 80, 'rank', 'pending_check')"),
+                    {"sid": sub_ids[label], "r": rank},
+                )
+
+            for label, dec in [
+                ("approved_a", "approved"),
+                ("approved_b", "approved"),
+                ("approved_c", "approved"),
+                ("rejected_d", "rejected"),
+            ]:
+                await session.execute(
+                    text("INSERT INTO finalist_checks (submission_id, admin_id, decision, reason) "
+                         "VALUES (:sid, :aid, :dec, :reason)"),
+                    {"sid": sub_ids[label], "aid": adm_id, "dec": dec,
+                     "reason": None if dec == "approved" else "Identity mismatch"},
+                )
+
+        # Wrong phase -> 403
+        r = await client.get("/api/judge/stage2/finalists", headers=j1_h)
+        assert r.status_code == 403, r.text
+        assert "stage_2_live" in r.json()["detail"]
+
+        # Move to stage_2_live
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_2_live' WHERE id = 1")
+            )
+
+        # J1: 3 approved finalists, all has_my_score=False, exact field set
+        r = await client.get("/api/judge/stage2/finalists", headers=j1_h)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["count"] == 3, f"Expected 3, got {body['count']}: {body['finalists']}"
+        for f in body["finalists"]:
+            assert set(f.keys()) == {"submission_id", "participant_number", "has_my_score"}, \
+                f"Unexpected fields: {f.keys()}"
+            assert f["has_my_score"] is False
+
+        # Excluded labels not present
+        returned_sub_ids = {f["submission_id"] for f in body["finalists"]}
+        assert sub_ids["rejected_d"] not in returned_sub_ids
+        assert sub_ids["nonfinalist_e"] not in returned_sub_ids
+
+        # J1 scores approved_a
+        r = await client.post(
+            f"/api/judge/stage2/{sub_ids['approved_a']}/score",
+            json={"c1": 80, "c2": 75, "c3": 85, "c4": 70},
+            headers=j1_h,
+        )
+        assert r.status_code == 200, r.text
+
+        # J1: approved_a now has_my_score=True; others False
+        r = await client.get("/api/judge/stage2/finalists", headers=j1_h)
+        assert r.status_code == 200
+        body = r.json()
+        flags = {f["submission_id"]: f["has_my_score"] for f in body["finalists"]}
+        assert flags[sub_ids["approved_a"]] is True
+        assert flags[sub_ids["approved_b"]] is False
+        assert flags[sub_ids["approved_c"]] is False
+
+        # J2: all still False (per-judge isolation)
+        r = await client.get("/api/judge/stage2/finalists", headers=j2_h)
+        assert r.status_code == 200
+        body = r.json()
+        for f in body["finalists"]:
+            assert f["has_my_score"] is False, \
+                f"J2 sees True for {f['submission_id']} (leaked J1's score)"
+
+        # Admin hitting judge route -> 403 (wrong role)
+        r = await client.get("/api/judge/stage2/finalists", headers=adm_headers)
+        assert r.status_code == 403, r.text
+

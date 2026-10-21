@@ -904,3 +904,42 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION fn_select_finalists() TO admin_role;
+
+-- ----------------------------------------------------------------------------
+-- 7. STAGE 2 FINALIST LIST (per-judge view)
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fn_list_stage2_finalists()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_judge_id INT := current_user_id();
+    v_result JSONB;
+BEGIN
+    IF v_judge_id IS NULL THEN
+        RAISE EXCEPTION 'Unauthorized: Judge identity required.';
+    END IF;
+
+    SELECT jsonb_agg(jsonb_build_object(
+        'submission_id', f.submission_id,
+        'participant_number', s.participant_number,
+        'has_my_score', EXISTS(
+            SELECT 1 FROM stage2_scores ss
+            WHERE ss.submission_id = f.submission_id
+              AND ss.judge_id = v_judge_id
+        )
+    ) ORDER BY s.participant_number ASC)
+    INTO v_result
+    FROM finalists f
+    JOIN finalist_checks fc ON fc.submission_id = f.submission_id
+                           AND fc.decision = 'approved'
+    JOIN submissions s ON s.id = f.submission_id;
+
+    RETURN COALESCE(v_result, '[]'::jsonb);
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION fn_list_stage2_finalists() TO judge_role;

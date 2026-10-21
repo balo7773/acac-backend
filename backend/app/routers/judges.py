@@ -322,6 +322,33 @@ async def review_flag(flag_id: int, payload: FlagVotePayload, ctx=Depends(get_ju
     return {"flag_id": flag_id, "resulting_status": resulting_status}
 
 
+@router.get("/stage2/finalists")
+async def list_stage2_finalists(ctx=Depends(get_judge_context)):
+    """List approved Stage 2 finalists with per-judge has_my_score flag.
+    No identity fields, no scores. Phase guard: stage_2_live or completed."""
+    judge_id, session = ctx
+
+    phase_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    phase = phase_res.scalar_one()
+    if phase not in ("stage_2_live", "completed"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Stage 2 finalist list only available in 'stage_2_live' or 'completed' "
+                f"(current: '{phase}')."
+            ),
+        )
+
+    res = await session.execute(text("SELECT fn_list_stage2_finalists()"))
+    finalists = res.scalar_one()
+    if finalists is None:
+        finalists = []
+
+    return {"finalists": finalists, "count": len(finalists)}
+
+
 @router.post("/stage2/{submission_id}/score")
 async def submit_stage2_live_score(
     submission_id: int,

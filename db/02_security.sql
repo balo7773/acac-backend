@@ -273,3 +273,11 @@ GRANT DELETE ON finalists, stage1_results, essay_scores, conclusion_scores, judg
 -- applies to judge_role, not admin_role. Logged in deviation register.
 -- ----------------------------------------------------------------------------
 GRANT INSERT ON judge_sessions, essay_scores, conclusion_scores TO admin_role;
+
+-- finalist_checks: /finalist-check uses ON CONFLICT DO UPDATE; conftest needs DELETE
+GRANT INSERT, UPDATE, DELETE ON finalist_checks TO admin_role;
+
+-- Test setup: conftest/audit tests build finalist fixtures via direct INSERT.
+-- Production path goes through fn_select_finalists() (SECURITY DEFINER),
+-- so admin_role never needed this for production reads/writes.
+GRANT INSERT ON finalists TO admin_role;
