@@ -281,3 +281,7 @@ GRANT INSERT, UPDATE, DELETE ON finalist_checks TO admin_role;
 -- Production path goes through fn_select_finalists() (SECURITY DEFINER),
 -- so admin_role never needed this for production reads/writes.
 GRANT INSERT ON finalists TO admin_role;
+
+-- Test setup: endpoint 8 (peers) needs to seed peer scores directly.
+-- Production write goes through submit_stage2_scores() (SECURITY DEFINER).
+GRANT INSERT, UPDATE, DELETE ON stage2_scores TO admin_role;
