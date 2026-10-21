@@ -2175,3 +2175,162 @@ async def test_p2_fix_8_settings_versioned_update():
         assert body["old_version"] == body["new_version"]
         assert body["changed_fields"] == {}
 
+@pytest.mark.asyncio
+async def test_p2_fix_9_candidate_disqualify_endpoint():
+    """Endpoint 5/8: POST /api/admin/candidates/{participant_number}/disqualify
+    - 404 for unknown participant_number
+    - 422 for empty reason (Pydantic)
+    - Deactivate at stage_1_review -> recomputed=True, warning=None
+    - DQ flag + reason set on candidates row
+    - audit_log 'candidate_disqualified' written
+    - Second attempt -> 409 (already DQ)
+    - At results_published -> recomputed=False, warning present, DQ still set
+    Exclusion from stage1_results is validated separately by the SQL grep
+    (`c.is_disqualified = FALSE` filter) and by test_p2_fix_6's identical
+    recompute path (guarded auto-recompute on judge toggle).
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'pre_launch' WHERE id = 1")
+            )
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # Register one candidate to disqualify
+        sfx = uuid.uuid4().hex[:6]
+        reg = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": f"DQ Cand {sfx}",
+                "matric_number": f"AFIT/DQ9/{sfx}",
+                "whatsapp_number": f"+234{uuid.uuid4().int % 10**9:09d}",
+                "linkedin_url": "https://linkedin.com/in/dq9",
+                "password": "Password123!",
+            },
+        )
+        assert reg.status_code == 201, reg.text
+        pno = reg.json()["participant_number"]
+        cand_id = reg.json()["user_id"]
+
+        # 404 for unknown participant_number
+        r = await client.post(
+            "/api/admin/candidates/999999999/disqualify",
+            json={"reason": "test"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 404, r.text
+
+        # 422 for empty reason
+        r = await client.post(
+            f"/api/admin/candidates/{pno}/disqualify",
+            json={"reason": ""},
+            headers=adm_headers,
+        )
+        assert r.status_code == 422, r.text
+
+        # Move to stage_1_review (recompute path)
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_1_review' WHERE id = 1")
+            )
+
+        # Valid DQ -> recomputed=True
+        r = await client.post(
+            f"/api/admin/candidates/{pno}/disqualify",
+            json={"reason": "Plagiarism confirmed by admin review"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["is_disqualified"] is True
+        assert body["recomputed"] is True
+        assert body["warning"] is None
+
+        # DB state
+        async with get_rls_session("admin_role") as session:
+            row = (await session.execute(
+                text("SELECT is_disqualified, disqualification_reason FROM candidates WHERE id = :cid"),
+                {"cid": cand_id},
+            )).mappings().one()
+            assert row["is_disqualified"] is True
+            assert row["disqualification_reason"] == "Plagiarism confirmed by admin review"
+
+            audit = (await session.execute(
+                text("SELECT action FROM audit_log WHERE action = 'candidate_disqualified' "
+                     "AND target_type = 'candidate' AND target_id = :cid "
+                     "ORDER BY id DESC LIMIT 1"),
+                {"cid": cand_id},
+            )).scalar_one_or_none()
+            assert audit == "candidate_disqualified"
+
+        # Second attempt -> 409
+        r = await client.post(
+            f"/api/admin/candidates/{pno}/disqualify",
+            json={"reason": "Duplicate"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 409, r.text
+        assert "already disqualified" in r.json()["detail"].lower()
+
+        # Post-publication DQ path (different candidate).
+        # Registration only allows pre_launch / stage_1_submitting, so:
+        # reset to stage_1_submitting, register cand2, THEN move to results_published.
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_1_submitting' WHERE id = 1")
+            )
+
+        sfx2 = uuid.uuid4().hex[:6]
+        reg2 = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": f"DQ Cand2 {sfx2}",
+                "matric_number": f"AFIT/DQ9/{sfx2}",
+                "whatsapp_number": f"+234{uuid.uuid4().int % 10**9:09d}",
+                "linkedin_url": "https://linkedin.com/in/dq9b",
+                "password": "Password123!",
+            },
+        )
+        assert reg2.status_code == 201, reg2.text
+        pno2 = reg2.json()["participant_number"]
+
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'results_published' WHERE id = 1")
+            )
+
+        r = await client.post(
+            f"/api/admin/candidates/{pno2}/disqualify",
+            json={"reason": "Post-publication correction"},
+            headers=adm_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["recomputed"] is False
+        assert body["warning"] is not None
+        assert "results_published" in body["warning"]
+
+        # Candidate IS still disqualified even though recompute was skipped
+        async with get_rls_session("admin_role") as session:
+            row = (await session.execute(
+                text("SELECT is_disqualified FROM candidates WHERE participant_number = :pno"),
+                {"pno": pno2},
+            )).mappings().one()
+            assert row["is_disqualified"] is True
+

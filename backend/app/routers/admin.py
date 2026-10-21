@@ -108,6 +108,85 @@ async def update_competition_phase(payload: PhaseUpdateRequest, ctx=Depends(get_
     return {"current_phase": payload.new_phase}
 
 
+class DisqualifyCandidateRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=1000)
+
+
+@router.post("/candidates/{participant_number}/disqualify")
+async def disqualify_candidate(
+    participant_number: int,
+    payload: DisqualifyCandidateRequest,
+    ctx=Depends(get_admin_context),
+):
+    """Manually disqualify a candidate. Sets is_disqualified + reason; excludes
+    them from stage1_results on next recompute. Guarded recompute mirrors
+    judge toggle: recompute runs in grading/review/finalist-check phases only."""
+    admin_id, session = ctx
+
+    cand_res = await session.execute(
+        text("SELECT id, is_disqualified FROM candidates WHERE participant_number = :pno"),
+        {"pno": participant_number},
+    )
+    cand = cand_res.mappings().first()
+    if cand is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Participant {participant_number} not found.",
+        )
+    if cand["is_disqualified"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Participant {participant_number} is already disqualified.",
+        )
+
+    await session.execute(
+        text(
+            "UPDATE candidates SET is_disqualified = TRUE, "
+            "disqualification_reason = :reason WHERE id = :cid"
+        ),
+        {"cid": cand["id"], "reason": payload.reason.strip()},
+    )
+
+    await session.execute(
+        text(
+            "INSERT INTO audit_log (actor_role, actor_id, action, target_type, target_id, details) "
+            "VALUES ('admin', :aid, 'candidate_disqualified', 'candidate', :cid, CAST(:det AS jsonb))"
+        ),
+        {
+            "aid": admin_id,
+            "cid": cand["id"],
+            "det": json.dumps({
+                "participant_number": participant_number,
+                "reason": payload.reason.strip(),
+            }),
+        },
+    )
+
+    phase_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    phase = phase_res.scalar_one()
+
+    recompute_phases = ("stage_1_grading", "stage_1_review", "finalist_check")
+    recomputed = False
+    warning = None
+    if phase in recompute_phases:
+        await session.execute(text("SELECT compute_stage1_results()"))
+        recomputed = True
+    elif phase in ("results_published", "stage_2_live", "completed"):
+        warning = (
+            f"Candidate disqualified; leaderboard NOT recomputed (phase='{phase}'). "
+            f"Call /compute-stage1 explicitly if you intend to change published results."
+        )
+
+    return {
+        "participant_number": participant_number,
+        "is_disqualified": True,
+        "recomputed": recomputed,
+        "warning": warning,
+    }
+
+
 class SettingsUpdateRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
 
