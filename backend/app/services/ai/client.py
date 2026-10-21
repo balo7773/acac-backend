@@ -15,7 +15,9 @@ from app.core.config import settings
 
 
 class AIClientError(Exception):
-    pass
+    def __init__(self, message: str, category: str = "UNKNOWN"):
+        super().__init__(message)
+        self.category = category
 
 
 async def _post_with_retry(url: str, payload: dict, headers: dict, *, timeout: float, max_retries: int = 3) -> dict:
@@ -31,23 +33,38 @@ async def _post_with_retry(url: str, payload: dict, headers: dict, *, timeout: f
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)
                 continue
-            raise AIClientError(f"network failure after {max_retries} attempts: {e}")
+            raise AIClientError(f"network failure after {max_retries} attempts: {e}", category="NETWORK")
 
         if resp.status_code == 200:
             return resp.json()
 
-        # 5xx and 429 are transient — retry
+        # Permanent — no retry
+        if resp.status_code in (401, 403):
+            raise AIClientError(
+                f"HTTP {resp.status_code}: {resp.text[:300]}", category="AUTH"
+            )
+        if resp.status_code == 402:
+            raise AIClientError(
+                f"HTTP 402: {resp.text[:300]}", category="QUOTA"
+            )
+
+        # Transient — retry with backoff
         if resp.status_code in (429, 500, 502, 503, 504):
             last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)
                 continue
-            raise AIClientError(f"{last_error} (after {max_retries} attempts)")
+            cat = "RATE_LIMIT" if resp.status_code == 429 else "SERVER"
+            raise AIClientError(
+                f"{last_error} (after {max_retries} attempts)", category=cat
+            )
 
-        # 4xx (other than 429) is permanent — fail immediately
-        raise AIClientError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+        # Other 4xx — permanent
+        raise AIClientError(
+            f"HTTP {resp.status_code}: {resp.text[:300]}", category="CLIENT"
+        )
 
-    raise AIClientError(f"unreachable: {last_error}")
+    raise AIClientError(f"unreachable: {last_error}", category="UNKNOWN")
 
 
 def _parse_json_content(content: str) -> dict:
@@ -72,7 +89,7 @@ def _parse_json_content(content: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    raise AIClientError(f"Could not parse JSON from model output: {content[:200]}")
+    raise AIClientError(f"Could not parse JSON from model output: {content[:200]}", category="PARSE")
 
 
 async def call_deepseek(
@@ -100,7 +117,7 @@ async def call_deepseek(
     try:
         content = raw["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
-        raise AIClientError(f"DeepSeek response shape unexpected: {e}; raw={str(raw)[:300]}")
+        raise AIClientError(f"DeepSeek response shape unexpected: {e}; raw={str(raw)[:300]}", category="SHAPE")
 
     parsed = _parse_json_content(content)
     return {
@@ -134,7 +151,7 @@ async def call_gemma(
     try:
         parts = raw["candidates"][0]["content"]["parts"]
     except (KeyError, IndexError) as e:
-        raise AIClientError(f"Gemma response shape unexpected: {e}; raw={str(raw)[:300]}")
+        raise AIClientError(f"Gemma response shape unexpected: {e}; raw={str(raw)[:300]}", category="SHAPE")
 
     content = ""
     for part in reversed(parts):
@@ -143,7 +160,7 @@ async def call_gemma(
             break
 
     if not content:
-        raise AIClientError(f"Gemma returned no usable content: {str(raw)[:300]}")
+        raise AIClientError(f"Gemma returned no usable content: {str(raw)[:300]}", category="PARSE")
 
     parsed = _parse_json_content(content)
     return {

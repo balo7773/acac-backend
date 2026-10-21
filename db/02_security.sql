@@ -285,3 +285,6 @@ GRANT INSERT ON finalists TO admin_role;
 -- Test setup: endpoint 8 (peers) needs to seed peer scores directly.
 -- Production write goes through submit_stage2_scores() (SECURITY DEFINER).
 GRANT INSERT, UPDATE, DELETE ON stage2_scores TO admin_role;
+
+-- Admin health endpoint reads job status/errors
+GRANT SELECT ON ai_jobs TO admin_role;

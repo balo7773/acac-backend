@@ -448,6 +448,96 @@ async def update_settings(
     }
 
 
+@router.get("/ai-health")
+async def ai_health(ctx=Depends(get_admin_context)):
+    """Per-model AI status for admin visibility. Surfaces whether DeepSeek/Gemma
+    are working, and if not, why (QUOTA, AUTH, SERVER, etc.). No essay content,
+    no scores — just job metadata and error categories."""
+    import re as _re
+    from datetime import datetime, timezone
+
+    admin_id, session = ctx
+
+    CATEGORY_TO_STATUS = {
+        "QUOTA": "QUOTA_EXHAUSTED",
+        "AUTH": "AUTH_FAILED",
+        "RATE_LIMIT": "RATE_LIMITED",
+        "SERVER": "SERVER_ERRORS",
+        "NETWORK": "NETWORK_ERRORS",
+        "PARSE": "PARSE_ERRORS",
+        "SHAPE": "RESPONSE_SHAPE_ERRORS",
+        "CLIENT": "CLIENT_ERROR",
+    }
+
+    per_model = {}
+    for model in ("deepseek", "gemma"):
+        # Counts per status in last hour
+        counts_res = await session.execute(
+            text(
+                "SELECT status, COUNT(*) AS n FROM ai_jobs "
+                "WHERE model_name = :m AND created_at > NOW() - INTERVAL '1 hour' "
+                "GROUP BY status"
+            ),
+            {"m": model},
+        )
+        counts = {r["status"]: r["n"] for r in counts_res.mappings()}
+
+        # Most recent error (if any)
+        err_res = await session.execute(
+            text(
+                "SELECT last_error, created_at FROM ai_jobs "
+                "WHERE model_name = :m AND last_error IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"m": model},
+        )
+        err_row = err_res.mappings().first()
+
+        status_label = "IDLE"
+        last_error_msg = None
+        last_error_at = None
+
+        if err_row is not None:
+            last_error_msg = err_row["last_error"] or ""
+            last_error_at = err_row["created_at"].isoformat() if err_row["created_at"] else None
+            m = _re.match(r"^\[([A-Z_]+)\]", last_error_msg)
+            cat = m.group(1) if m else "UNKNOWN"
+            status_label = CATEGORY_TO_STATUS.get(cat, "DEGRADED")
+        elif counts.get("done", 0) > 0 or counts.get("running", 0) > 0:
+            status_label = "WORKING"
+
+        per_model[model] = {
+            "status": status_label,
+            "done_1h": counts.get("done", 0),
+            "errors_1h": counts.get("failed", 0) + counts.get("queued", 0)
+                         if err_row is not None else 0,
+            "running_1h": counts.get("running", 0),
+            "last_error": last_error_msg,
+            "last_error_at": last_error_at,
+        }
+
+    # Queue depth across all models (last 24h)
+    q_res = await session.execute(
+        text(
+            "SELECT status, COUNT(*) AS n FROM ai_jobs "
+            "WHERE created_at > NOW() - INTERVAL '24 hours' "
+            "GROUP BY status"
+        )
+    )
+    q = {r["status"]: r["n"] for r in q_res.mappings()}
+
+    return {
+        "models": per_model,
+        "queue_24h": {
+            "queued": q.get("queued", 0),
+            "running": q.get("running", 0),
+            "done": q.get("done", 0),
+            "failed": q.get("failed", 0),
+        },
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 class StartStage1Request(BaseModel):
     duration_hours: float = Field(..., gt=0, le=720)
 

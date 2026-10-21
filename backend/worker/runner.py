@@ -561,7 +561,7 @@ async def process_next_queued_job() -> bool:
                     "jid": job["id"],
                     "st": new_status,
                     "att": attempts,
-                    "err": str(exc)[:500],
+                    "err": f"[{getattr(exc, 'category', 'UNKNOWN')}] {str(exc)[:800]}",
                     "backoff": attempts * 15,
                 },
             )

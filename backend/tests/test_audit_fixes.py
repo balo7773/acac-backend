@@ -2873,3 +2873,112 @@ async def test_p2_fix_12_stage2_peer_view():
         )
         assert r.status_code == 403, r.text
 
+@pytest.mark.asyncio
+async def test_p2_fix_14_ai_health_endpoint():
+    """Endpoint: GET /api/admin/ai-health
+    - Admin only (403 for others)
+    - Reports QUOTA_EXHAUSTED when latest error has [QUOTA]
+    - Reports SERVER_ERRORS when latest error has [SERVER]
+    - Reports IDLE when no jobs
+    - Queue counts per status in 24h window
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_1_submitting' WHERE id = 1")
+            )
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # Register one candidate (ai_jobs has FK on submission_id)
+        sfx = uuid.uuid4().hex[:6]
+        reg = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": f"Health Cand {sfx}",
+                "matric_number": f"AFIT/HL/{sfx}",
+                "whatsapp_number": f"+234{uuid.uuid4().int % 10**9:09d}",
+                "linkedin_url": "https://linkedin.com/in/hl",
+                "password": "Password123!",
+            },
+        )
+        assert reg.status_code == 201, reg.text
+        sub_id = reg.json()["submission_id"]
+
+        # Seed ai_jobs
+        async with get_rls_session("admin_role") as session:
+            await session.execute(text("DELETE FROM ai_jobs"))
+            await session.execute(
+                text("INSERT INTO ai_jobs (job_type, submission_id, model_name, run_id, status, attempts, last_error, next_attempt_at, created_at) "
+                     "VALUES ('job_b_run', :sid, 'deepseek', 1, 'failed', 3, '[QUOTA] HTTP 402: insufficient balance', NOW(), NOW() - INTERVAL '5 minutes')"),
+                {"sid": sub_id},
+            )
+            await session.execute(
+                text("INSERT INTO ai_jobs (job_type, submission_id, model_name, run_id, status, attempts, last_error, next_attempt_at, created_at) "
+                     "VALUES ('job_b_run', :sid, 'deepseek', 2, 'done', 0, NULL, NOW(), NOW() - INTERVAL '3 minutes')"),
+                {"sid": sub_id},
+            )
+            await session.execute(
+                text("INSERT INTO ai_jobs (job_type, submission_id, model_name, run_id, status, attempts, last_error, next_attempt_at, created_at) "
+                     "VALUES ('job_b_run', :sid, 'gemma', 1, 'failed', 3, '[SERVER] HTTP 500: internal error', NOW(), NOW() - INTERVAL '4 minutes')"),
+                {"sid": sub_id},
+            )
+
+        # Non-admin -> 403
+        j_sfx = uuid.uuid4().hex[:6]
+        j_uname = f"hl_j_{j_sfx}"
+        await client.post(
+            "/api/admin/judges",
+            json={"username": j_uname, "password": "JudgeP2026!",
+                  "judge_type": "internal", "mask_avatar": "mask_owl"},
+            headers=adm_headers,
+        )
+        j_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": j_uname, "password": "JudgeP2026!", "role": "judge"},
+        )
+        j_headers = {"Authorization": f"Bearer {_extract_cookie_val(j_login)}"}
+        r = await client.get("/api/admin/ai-health", headers=j_headers)
+        assert r.status_code == 403, r.text
+
+        # Admin -> 200
+        r = await client.get("/api/admin/ai-health", headers=adm_headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+
+        ds = body["models"]["deepseek"]
+        assert ds["status"] == "QUOTA_EXHAUSTED", f"deepseek status = {ds['status']}"
+        assert "[QUOTA]" in ds["last_error"]
+        assert ds["done_1h"] == 1, f"deepseek done_1h = {ds['done_1h']}"
+
+        gm = body["models"]["gemma"]
+        assert gm["status"] == "SERVER_ERRORS", f"gemma status = {gm['status']}"
+        assert "[SERVER]" in gm["last_error"]
+
+        assert body["queue_24h"]["failed"] == 2
+        assert body["queue_24h"]["done"] == 1
+
+        # Cleanup + idle case
+        async with get_rls_session("admin_role") as session:
+            await session.execute(text("DELETE FROM ai_jobs"))
+
+        r = await client.get("/api/admin/ai-health", headers=adm_headers)
+        assert r.status_code == 200
+        assert r.json()["models"]["deepseek"]["status"] == "IDLE"
+        assert r.json()["models"]["gemma"]["status"] == "IDLE"
+
