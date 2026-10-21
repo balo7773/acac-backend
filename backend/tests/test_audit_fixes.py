@@ -2334,3 +2334,154 @@ async def test_p2_fix_9_candidate_disqualify_endpoint():
             )).mappings().one()
             assert row["is_disqualified"] is True
 
+@pytest.mark.asyncio
+async def test_p2_fix_10_finalist_selection():
+    """Endpoint 6/8: POST /api/admin/finalists/select
+    - Wrong phase -> 403
+    - 7 candidates, N=5, blur=0.5
+    - Top 5 by rank + 1 within blur admitted (6 total)
+    - Bottom 1 excluded
+    - finalists table populated correctly
+    - audit_log 'finalists_selected' written
+    - Idempotent: re-call produces same 6
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async def _clear_hook(resp):
+            client.cookies.clear()
+        client.event_hooks["response"].append(_clear_hook)
+
+        # Setup admin + submitting phase
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("INSERT INTO admins (username, password_hash) "
+                     "VALUES ('chief_admin', :pw) ON CONFLICT (username) DO NOTHING"),
+                {"pw": get_password_hash("Admin_Pass_2026!")},
+            )
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'stage_1_submitting' WHERE id = 1")
+            )
+
+        adm_login = await client.post(
+            "/api/auth/login",
+            json={"identifier": "chief_admin", "password": "Admin_Pass_2026!", "role": "admin"},
+        )
+        assert adm_login.status_code == 200
+        adm_headers = {"Authorization": f"Bearer {_extract_cookie_val(adm_login)}"}
+
+        # 3 internal judges
+        j_suffix = uuid.uuid4().hex[:6]
+        judge_ids = []
+        async with get_rls_session("admin_role") as session:
+            for i, mask in enumerate(["mask_owl", "mask_falcon", "mask_lion"]):
+                res = await session.execute(
+                    text("INSERT INTO judges (username, password_hash, judge_type, mask_avatar) "
+                         "VALUES (:u, :ph, 'internal', :m) RETURNING id"),
+                    {"u": f"sel_j{i}_{j_suffix}", "ph": get_password_hash("JudgeP2026!"), "m": mask},
+                )
+                judge_ids.append(res.scalar_one())
+
+        # 7 candidates with score profiles
+        score_profiles = [
+            (80.0, 25),  # A -> 81.00 rank 1
+            (75.0, 25),  # B -> 77.50 rank 2
+            (70.0, 25),  # C -> 74.00 rank 3
+            (65.0, 25),  # D -> 70.50 rank 4
+            (60.0, 25),  # E -> 67.00 rank 5
+            (59.5, 25),  # F -> 66.65 blur (0.35 below E)
+            (55.0, 25),  # G -> 63.50 excluded
+        ]
+        sub_ids = []
+        for idx, (essay_score, conc_score) in enumerate(score_profiles):
+            sfx = uuid.uuid4().hex[:6]
+            reg = await client.post(
+                "/api/auth/register",
+                json={
+                    "full_name": f"Sel Cand {idx} {sfx}",
+                    "matric_number": f"AFIT/SEL/{sfx}",
+                    "whatsapp_number": f"+234{uuid.uuid4().int % 10**9:09d}",
+                    "linkedin_url": "https://linkedin.com/in/sel",
+                    "password": "Password123!",
+                },
+            )
+            assert reg.status_code == 201, reg.text
+            sub_id = reg.json()["submission_id"]
+            sub_ids.append(sub_id)
+
+            async with get_rls_session("admin_role") as session:
+                await session.execute(
+                    text("UPDATE submissions SET status='submitted' WHERE id=:sid"),
+                    {"sid": sub_id},
+                )
+                for jid in judge_ids:
+                    await session.execute(
+                        text("INSERT INTO judge_sessions (submission_id, judge_id, status) "
+                             "VALUES (:sid, :jid, 'locked_final')"),
+                        {"sid": sub_id, "jid": jid},
+                    )
+                    for ck in ['c1', 'c2', 'c3', 'c4', 'c5']:
+                        await session.execute(
+                            text("INSERT INTO essay_scores (submission_id, judge_id, criterion_key, initial_raw_score) "
+                                 "VALUES (:sid, :jid, :ck, :score)"),
+                            {"sid": sub_id, "jid": jid, "ck": ck, "score": essay_score},
+                        )
+                    await session.execute(
+                        text("INSERT INTO conclusion_scores (submission_id, judge_id, initial_raw_score) "
+                             "VALUES (:sid, :jid, :cs)"),
+                        {"sid": sub_id, "jid": jid, "cs": conc_score},
+                    )
+
+        # Wrong phase -> 403
+        r = await client.post("/api/admin/finalists/select", headers=adm_headers)
+        assert r.status_code == 403, r.text
+        assert "finalist_check" in r.json()["detail"]
+
+        # Move to finalist_check
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE competition_state SET current_phase = 'finalist_check' WHERE id = 1")
+            )
+
+        # Selection
+        r = await client.post("/api/admin/finalists/select", headers=adm_headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        admitted = body["admitted"]
+        assert body["count"] == 6, f"Expected 6 admitted, got {body['count']}: {admitted}"
+
+        admitted_by_sub = {a["submission_id"]: a for a in admitted}
+
+        # A-E: admitted_by='rank', status='pending_check'
+        for i in range(5):
+            assert sub_ids[i] in admitted_by_sub, f"Cand {i} missing from admitted"
+            entry = admitted_by_sub[sub_ids[i]]
+            assert entry["admitted_by"] == "rank", f"Cand {i}: expected 'rank', got '{entry['admitted_by']}'"
+            assert entry["status"] == "pending_check"
+
+        # F: admitted_by='blur'
+        assert sub_ids[5] in admitted_by_sub, "F should be admitted by blur"
+        assert admitted_by_sub[sub_ids[5]]["admitted_by"] == "blur"
+
+        # G: excluded
+        assert sub_ids[6] not in admitted_by_sub, "G should NOT be admitted"
+
+        # DB persistence + audit
+        async with get_rls_session("admin_role") as session:
+            count = (await session.execute(text("SELECT COUNT(*) FROM finalists"))).scalar_one()
+            assert count == 6, f"finalists has {count} rows, expected 6"
+
+            audit_action = (await session.execute(
+                text("SELECT action FROM audit_log WHERE action = 'finalists_selected' "
+                     "ORDER BY id DESC LIMIT 1")
+            )).scalar_one_or_none()
+            assert audit_action == "finalists_selected"
+
+        # Idempotency
+        r2 = await client.post("/api/admin/finalists/select", headers=adm_headers)
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["count"] == 6
+
+        async with get_rls_session("admin_role") as session:
+            count2 = (await session.execute(text("SELECT COUNT(*) FROM finalists"))).scalar_one()
+            assert count2 == 6, f"After idempotent re-call: {count2} rows"
+

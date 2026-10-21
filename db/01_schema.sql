@@ -348,3 +348,20 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_login_attempts_ident_time ON login_attempts (identifier, attempted_at);
 CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time ON login_attempts (ip_address, attempted_at);
+
+-- ----------------------------------------------------------------------------
+-- 7. FINALISTS (Top-N + blur margin selections from stage1_results)
+-- ----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS finalists (
+    submission_id INT PRIMARY KEY REFERENCES submissions(id),
+    stage1_rank INT NOT NULL,
+    composite_score NUMERIC NOT NULL,
+    admitted_by TEXT NOT NULL CHECK (admitted_by IN ('rank', 'blur', 'replacement')),
+    status TEXT NOT NULL DEFAULT 'pending_check' CHECK (status IN ('pending_check', 'eligible', 'disqualified')),
+    check_notes TEXT,
+    checked_at TIMESTAMPTZ,
+    admitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+GRANT SELECT ON finalists TO admin_role;

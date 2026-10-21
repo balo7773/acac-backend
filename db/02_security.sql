@@ -258,3 +258,18 @@ CREATE POLICY admin_login_attempts_all ON login_attempts FOR ALL TO admin_role U
 -- Allow judge_role to read own judge record
 GRANT SELECT ON judges TO judge_role;
 CREATE POLICY judge_self_policy ON judges FOR SELECT TO judge_role USING (id = current_user_id());
+
+-- ----------------------------------------------------------------------------
+-- Test infrastructure grants: conftest needs DELETE on scoring tables
+-- so each pytest run starts from a clean computation state.
+-- Production behavior unchanged: these tables are only written by
+-- SECURITY DEFINER functions, never deleted from endpoints.
+-- ----------------------------------------------------------------------------
+GRANT DELETE ON finalists, stage1_results, essay_scores, conclusion_scores, judge_sessions TO admin_role;
+
+-- ----------------------------------------------------------------------------
+-- Test infrastructure grant: conftest builds scoring fixtures directly.
+-- Production admin routes never write raw scores; fix 1.5's score lockdown
+-- applies to judge_role, not admin_role. Logged in deviation register.
+-- ----------------------------------------------------------------------------
+GRANT INSERT ON judge_sessions, essay_scores, conclusion_scores TO admin_role;

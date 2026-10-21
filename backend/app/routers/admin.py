@@ -108,6 +108,53 @@ async def update_competition_phase(payload: PhaseUpdateRequest, ctx=Depends(get_
     return {"current_phase": payload.new_phase}
 
 
+@router.post("/finalists/select")
+async def select_finalists(ctx=Depends(get_admin_context)):
+    """Select the top-N finalists + blur-margin candidates from stage1_results.
+    Forces a fresh recompute first to guard against stale stage1_results.
+    Only callable in 'finalist_check' phase."""
+    admin_id, session = ctx
+
+    cur_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    current_phase = cur_res.scalar_one()
+    if current_phase != "finalist_check":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Finalist selection only allowed in 'finalist_check' phase "
+                f"(current: '{current_phase}')."
+            ),
+        )
+
+    # Fresh recompute — wipes stale stage1_results (e.g. legacy corrupted rows)
+    await session.execute(text("SELECT compute_stage1_results()"))
+
+    # Select
+    res = await session.execute(text("SELECT fn_select_finalists()"))
+    admitted = res.scalar_one()
+    if isinstance(admitted, str):
+        admitted = json.loads(admitted)
+    if admitted is None:
+        admitted = []
+
+    admitted_count = len(admitted)
+
+    await session.execute(
+        text(
+            "INSERT INTO audit_log (actor_role, actor_id, action, target_type, details) "
+            "VALUES ('admin', :aid, 'finalists_selected', 'finalists', CAST(:det AS jsonb))"
+        ),
+        {
+            "aid": admin_id,
+            "det": json.dumps({"admitted_count": admitted_count}),
+        },
+    )
+
+    return {"admitted": admitted, "count": admitted_count}
+
+
 class DisqualifyCandidateRequest(BaseModel):
     reason: str = Field(..., min_length=1, max_length=1000)
 

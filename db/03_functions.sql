@@ -834,3 +834,73 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION fn_get_candidate_verdict() TO candidate_role, admin_role;
+
+-- ----------------------------------------------------------------------------
+-- 6. FINALIST SELECTION (Top-N + blur margin from stage1_results)
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fn_select_finalists()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_cfg settings%ROWTYPE;
+    v_N INT;
+    v_blur NUMERIC;
+    v_sn NUMERIC;
+    v_count INT;
+    v_result JSONB;
+BEGIN
+    SELECT * INTO v_cfg FROM settings WHERE is_active = TRUE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'No active settings row';
+    END IF;
+    v_N := v_cfg.top_finalists_target;
+    v_blur := v_cfg.blur_margin;
+
+    SELECT COUNT(*) INTO v_count FROM stage1_results;
+    IF v_count = 0 THEN
+        RAISE EXCEPTION 'stage1_results is empty; run compute_stage1_results() first.';
+    END IF;
+
+    -- Fresh selection each call: wipe prior rank/blur admissions (preserve replacements from promote)
+    DELETE FROM finalists WHERE admitted_by IN ('rank', 'blur');
+
+    -- Score at Nth position (submission_id is tie-breaker for the OFFSET)
+    SELECT composite_score INTO v_sn
+    FROM stage1_results
+    ORDER BY rank ASC, submission_id ASC
+    LIMIT 1 OFFSET (v_N - 1);
+
+    IF v_sn IS NULL THEN
+        -- Fewer than N candidates exist: all within top N by rank are admitted as 'rank'
+        INSERT INTO finalists (submission_id, stage1_rank, composite_score, admitted_by, status)
+        SELECT submission_id, rank, composite_score, 'rank', 'pending_check'
+        FROM stage1_results
+        WHERE rank <= v_N;
+    ELSE
+        INSERT INTO finalists (submission_id, stage1_rank, composite_score, admitted_by, status)
+        SELECT submission_id, rank, composite_score,
+               CASE WHEN rank <= v_N THEN 'rank' ELSE 'blur' END,
+               'pending_check'
+        FROM stage1_results
+        WHERE rank <= v_N OR composite_score >= v_sn - v_blur;
+    END IF;
+
+    SELECT jsonb_agg(jsonb_build_object(
+        'submission_id', f.submission_id,
+        'stage1_rank', f.stage1_rank,
+        'composite_score', f.composite_score,
+        'admitted_by', f.admitted_by,
+        'status', f.status
+    ) ORDER BY f.stage1_rank ASC, f.submission_id ASC)
+    INTO v_result
+    FROM finalists f;
+
+    RETURN COALESCE(v_result, '[]'::jsonb);
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION fn_select_finalists() TO admin_role;

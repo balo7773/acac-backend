@@ -28,4 +28,8 @@ async def reset_competition_phase():
         # Reset settings to baseline version 1 (seed)
         await session.execute(text("UPDATE settings SET is_active = FALSE WHERE is_active = TRUE"))
         await session.execute(text("UPDATE settings SET is_active = TRUE WHERE version = 1"))
+        # Clean scoring artifacts so tests start from a clean computation state
+        await session.execute(text("DELETE FROM finalists"))
+        await session.execute(text("DELETE FROM stage1_results"))
+        await session.execute(text("DELETE FROM judge_sessions"))
     yield
