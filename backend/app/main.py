@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+from datetime import datetime, timezone
+import time as _time
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -27,6 +29,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/api/time")
+def server_time():
+    """Unauthenticated server clock. Frontend uses this to compute offset
+    between local clock and server clock for all countdown timers."""
+    now = datetime.now(timezone.utc)
+    return {
+        "server_now": now.isoformat(),
+        "epoch": _time.time(),
+    }
+
 
 app.include_router(auth.router)
 app.include_router(candidates.router)

@@ -2982,3 +2982,32 @@ async def test_p2_fix_14_ai_health_endpoint():
         assert r.json()["models"]["deepseek"]["status"] == "IDLE"
         assert r.json()["models"]["gemma"]["status"] == "IDLE"
 
+@pytest.mark.asyncio
+async def test_p2_fix_15_server_time_endpoint():
+    """GET /api/time
+    - Unauthenticated (no login required)
+    - Returns {server_now: ISO8601 with tz, epoch: float}
+    - Epoch is close to real current time (within 2s)
+    - Callable by any role without auth
+    """
+    import time as _time
+    from datetime import datetime
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        before = _time.time()
+        r = await client.get("/api/time")
+        after = _time.time()
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert set(body.keys()) == {"server_now", "epoch"}, f"unexpected keys: {body.keys()}"
+
+        parsed = datetime.fromisoformat(body["server_now"])
+        assert parsed.tzinfo is not None, "server_now must include timezone"
+
+        assert before <= body["epoch"] <= after + 0.5, \
+            f"epoch {body['epoch']} outside [{before}, {after}]"
+        assert abs(body["epoch"] - after) < 2.0, \
+            f"clock drift too large: {abs(body['epoch'] - after):.3f}s"
+
