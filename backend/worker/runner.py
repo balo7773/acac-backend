@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_rls_session
 from app.routers.candidates import FALLBACK_QUESTIONS
+from app.core.config import settings
+from app.services.ai.client import call_deepseek, call_gemma, AIClientError
 from app.services.pdf_service import locate_verbatim_quote
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -107,9 +109,12 @@ async def _generate_Simulated_or_api_eval(
 ) -> dict:
     """
     Produces structured per-criterion evaluations (c1..c5) and extracted claims.
-    Uses live API when keys are configured, or deterministic grounded extraction
-    from canonical_text when running in offline/test mode.
+    AI_MODE=real  -> real LLM via ai.client
+    AI_MODE=stub  -> deterministic grounded extraction (default; used in tests)
     """
+    if settings.AI_MODE == "real":
+        return await _generate_real_eval(model_name, run_id, canonical_text)
+
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", canonical_text) if len(s.strip()) > 20]
     if not sentences:
         sentences = [canonical_text[:120]]
@@ -580,3 +585,46 @@ async def run_worker_forever(poll_interval: float = 2.0):
 
 if __name__ == "__main__":
     asyncio.run(run_worker_forever())
+
+async def _generate_real_eval(model_name: str, run_id: int, canonical_text: str) -> dict:
+    """Real LLM evaluation. Same shape as the stub."""
+    from app.services.ai.schemas import EVAL_PROMPT_TEMPLATE
+
+    prompt = EVAL_PROMPT_TEMPLATE.replace("{{ESSAY}}", canonical_text)
+
+    if model_name == "deepseek":
+        result = await call_deepseek(prompt)
+    elif model_name == "gemma":
+        result = await call_gemma(prompt)
+    else:
+        raise AIClientError(f"Unknown model_name: {model_name}")
+
+    parsed = result["parsed"]
+
+    criteria_out = {}
+    for ckey in CRITERIA_KEYS:
+        entry = parsed.get("criteria", {}).get(ckey, {})
+        mark = max(0.0, min(1.0, float(entry.get("mark", 0.0))))
+        criteria_out[ckey] = {
+            "description_text": str(entry.get("description_text", ""))[:2000],
+            "reason_text": str(entry.get("reason_text", ""))[:2000],
+            "mark": mark,
+            "quote_text": str(entry.get("quote_text", ""))[:2000],
+        }
+
+    claims_out = []
+    for clm in parsed.get("claims", []):
+        ct = clm.get("claim_type", "")
+        if ct not in ("statistic", "agency", "date", "policy_outcome"):
+            continue
+        claims_out.append({
+            "claim_type": ct,
+            "claim_text": str(clm.get("claim_text", ""))[:2000],
+            "quote_text": str(clm.get("quote_text", ""))[:2000],
+        })
+
+    return {
+        "criteria": criteria_out,
+        "claims": claims_out if run_id == 1 else [],
+        "model_version": result["model_version"],
+    }

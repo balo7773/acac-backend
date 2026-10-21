@@ -26,8 +26,11 @@ class Settings(BaseSettings):
 
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_API_URL: str = "https://api.deepseek.com/v1/chat/completions"
+    DEEPSEEK_MODEL: str = "deepseek-v4-pro"
     GEMMA_API_KEY: str = ""
-    GEMMA_API_URL: str = "https://generativelanguage.googleapis.com/v1beta/models/gemma-2-27b-it:generateContent"
+    GEMMA_API_URL: str = "https://generativelanguage.googleapis.com/v1beta/models/gemma-4-26b-a4b-it:generateContent"
+    GEMMA_MODEL: str = "gemma-4-26b-a4b-it"
+    AI_MODE: str = "stub"  # "stub" (offline/tests) or "real" (live APIs)
 
     @property
     def async_database_url(self) -> str:
