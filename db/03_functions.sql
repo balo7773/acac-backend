@@ -764,6 +764,14 @@ BEGIN
         RAISE EXCEPTION 'Unauthorized: Judge identity required.';
     END IF;
 
+    IF NOT EXISTS (
+        SELECT 1 FROM finalists f
+        JOIN finalist_checks fc ON fc.submission_id = f.submission_id
+        WHERE f.submission_id = p_submission_id AND fc.decision = 'approved'
+    ) THEN
+        RAISE EXCEPTION 'Submission % is not an approved finalist; cannot record Stage 2 scores.', p_submission_id;
+    END IF;
+
     INSERT INTO stage2_scores (submission_id, judge_id, criterion_key, raw_score)
     VALUES
         (p_submission_id, v_judge_id, 'c1', p_c1),
