@@ -109,9 +109,13 @@ async def get_submission_evaluation_view(submission_id: int, ctx=Depends(get_jud
                 s.page_count,
                 cw.outcome AS conclusion_outcome,
                 cw.question_text,
-                cw.answer_text
+                cw.answer_text,
+                cw.window_ends_at,
+                COALESCE(js.status, 'not_started') AS judge_session_status,
+                js.phase_2_expires_at
             FROM submissions s
             LEFT JOIN conclusion_windows cw ON cw.submission_id = s.id
+            LEFT JOIN judge_sessions js ON js.submission_id = s.id AND js.judge_id = current_user_id()
             WHERE s.id = :sid
             """
         ),
@@ -201,7 +205,11 @@ async def open_full_essay(submission_id: int, ctx=Depends(get_judge_context)):
         )
         canon = res.scalar_one()
     except DBAPIError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e.orig))
+        msg = str(e.orig)
+        if "ESSAY_LOCKED|" in msg:
+            detail = msg.split("ESSAY_LOCKED|", 1)[1].strip().rstrip(".")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
 
     return {
         "submission_id": submission_id,

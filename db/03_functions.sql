@@ -692,6 +692,9 @@ AS $$
 DECLARE
     v_judge_id INT := current_user_id();
     v_canon TEXT;
+    v_outcome TEXT;
+    v_window_ends_at TIMESTAMPTZ;
+    v_now TIMESTAMPTZ := NOW();
 BEGIN
     IF v_judge_id IS NULL THEN
         RAISE EXCEPTION 'Unauthorized: Judge identity required.';
@@ -705,11 +708,30 @@ BEGIN
         RAISE EXCEPTION 'Submission text not found.';
     END IF;
 
+    -- Defense gate: essay opens only after the candidate's defense window
+    -- has closed, they've submitted, or it timed out.
+    SELECT outcome, window_ends_at
+    INTO v_outcome, v_window_ends_at
+    FROM conclusion_windows
+    WHERE submission_id = p_submission_id;
+
+    IF v_outcome = 'preparing' THEN
+        RAISE EXCEPTION 'ESSAY_LOCKED|Defense question not yet delivered.'
+            USING ERRCODE = '42501';
+    END IF;
+
+    IF v_outcome = 'in_progress'
+       AND (v_window_ends_at IS NULL OR v_now <= v_window_ends_at) THEN
+        RAISE EXCEPTION 'ESSAY_LOCKED|Defense window still open until %.',
+            to_char(v_window_ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+            USING ERRCODE = '42501';
+    END IF;
+
     INSERT INTO judge_sessions (submission_id, judge_id, status, opened_full_essay, opened_full_essay_at)
-    VALUES (p_submission_id, v_judge_id, 'phase_1_in_progress', TRUE, NOW())
+    VALUES (p_submission_id, v_judge_id, 'phase_1_in_progress', TRUE, v_now)
     ON CONFLICT (submission_id, judge_id) DO UPDATE
     SET opened_full_essay = TRUE,
-        opened_full_essay_at = COALESCE(judge_sessions.opened_full_essay_at, NOW());
+        opened_full_essay_at = COALESCE(judge_sessions.opened_full_essay_at, v_now);
 
     INSERT INTO audit_log (actor_role, actor_id, action, target_type, target_id, details)
     VALUES ('judge', v_judge_id, 'judge_opened_full_essay', 'submission', p_submission_id,
