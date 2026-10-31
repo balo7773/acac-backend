@@ -184,10 +184,19 @@ async def get_submission_evaluation_view(submission_id: int, ctx=Depends(get_jud
     )
     flags = [dict(r) for r in flags_res.mappings().all()]
 
+    summary_res = await session.execute(
+        text(
+            "SELECT summary_text, model_name, created_at FROM ai_summaries WHERE submission_id = :sid"
+        ),
+        {"sid": submission_id},
+    )
+    summary_row = summary_res.mappings().first()
+
     return {
         "submission": dict(sub),
         "bundle": bundle,
         "ai_claims": claims,
+        "ai_summary": dict(summary_row) if summary_row else None,
         "my_essay_scores": essay_scores,
         "my_conclusion_score": dict(conc_score) if conc_score else None,
         "flags": flags,

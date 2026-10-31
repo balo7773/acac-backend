@@ -18,3 +18,6 @@ storage/
 # Editor / OS noise
 .DS_Store
 *.swp
+.env.bak.*
+db_backup_*.sql
+runner_backup_*.py

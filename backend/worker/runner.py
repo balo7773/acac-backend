@@ -395,6 +395,51 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
 
         return {"combined_model": model_name}
 
+    elif jtype == "job_b_summary":
+        # One summary per submission. Uses only the essay text (no dependency on
+        # the per-criterion evaluations), so it can run independently of job_b_run.
+        res = await session.execute(
+            text("SELECT canonical_text FROM submissions WHERE id = :sid"),
+            {"sid": sid},
+        )
+        row = res.first()
+        if not row or not row.canonical_text:
+            return {"status": "skipped_no_essay"}
+
+        if settings.AI_MODE == "real":
+            try:
+                from app.services.ai.prompts.summary import SUMMARY_PROMPT
+                prompt = SUMMARY_PROMPT.replace("{essay}", row.canonical_text)
+                result = await call_deepseek(prompt, max_tokens=600, temperature=0.3)
+                summary_text = (result["parsed"].get("summary") or "").strip()[:2000]
+                if not summary_text or len(summary_text) < 40:
+                    raise AIClientError(
+                        f"summary too short (len={len(summary_text)})", category="PARSE"
+                    )
+                model_used = result.get("model_version", "deepseek-v4-pro")
+            except (AIClientError, KeyError) as e:
+                logger.warning("Summary generation failed sid=%s: %s", sid, e)
+                return {"status": "failed", "error": str(e)}
+        else:
+            # Stub: first 200 chars of essay, marked so it's obvious in the DB
+            summary_text = f"[STUB SUMMARY] {row.canonical_text[:200].strip()}"
+            model_used = "stub"
+
+        await session.execute(
+            text(
+                """
+                INSERT INTO ai_summaries (submission_id, summary_text, model_name)
+                VALUES (:sid, :st, :m)
+                ON CONFLICT (submission_id) DO UPDATE
+                SET summary_text = EXCLUDED.summary_text,
+                    model_name = EXCLUDED.model_name,
+                    created_at = NOW()
+                """
+            ),
+            {"sid": sid, "st": summary_text, "m": model_used},
+        )
+        return {"status": "done", "length": len(summary_text), "model": model_used}
+
     elif jtype == "job_c_run":
         res = await session.execute(
             text(
