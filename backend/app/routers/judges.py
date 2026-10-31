@@ -1,5 +1,6 @@
 import json
 from typing import Literal, Optional
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -114,6 +115,8 @@ async def get_submission_evaluation_view(submission_id: int, ctx=Depends(get_jud
                 cw.outcome AS conclusion_outcome,
                 cw.question_text,
                 cw.answer_text,
+                cw.question_delivered_at,
+                cw.answer_submitted_at,
                 cw.window_ends_at,
                 COALESCE(js.status, 'not_started') AS judge_session_status,
                 js.phase_2_expires_at
@@ -213,12 +216,30 @@ async def get_submission_evaluation_view(submission_id: int, ctx=Depends(get_jud
     summary_job = summary_job_res.first()
     summary_pending = summary_job is not None and summary_job.status in ('queued', 'running')
 
+    # Fast-answer advisory: if the candidate submitted their defense in under
+    # 5 minutes, surface it to the judge as a scrutiny signal (possible AI-assisted
+    # drafting / pre-written answer). Not proof — just a nudge to read carefully.
+    answer_duration_seconds = None
+    answered_under_5min = False
+    q_delivered = sub.get("question_delivered_at")
+    a_submitted = sub.get("answer_submitted_at")
+    if q_delivered and a_submitted:
+        try:
+            delta = (a_submitted - q_delivered).total_seconds()
+            if delta >= 0:
+                answer_duration_seconds = int(delta)
+                answered_under_5min = answer_duration_seconds < 300
+        except (TypeError, AttributeError):
+            pass
+
     return {
         "submission": dict(sub),
         "bundle": bundle,
         "ai_claims": claims,
         "ai_summary": dict(summary_row) if summary_row else None,
         "summary_pending": summary_pending,
+        "answer_duration_seconds": answer_duration_seconds,
+        "answered_under_5min": answered_under_5min,
         "markers": markers,
         "my_essay_scores": essay_scores,
         "my_conclusion_score": dict(conc_score) if conc_score else None,
