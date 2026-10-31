@@ -410,7 +410,7 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
             try:
                 from app.services.ai.prompts.summary import SUMMARY_PROMPT
                 prompt = SUMMARY_PROMPT.replace("{essay}", row.canonical_text)
-                result = await call_deepseek(prompt, max_tokens=600, temperature=0.3)
+                result = await call_deepseek(prompt, max_tokens=2000, temperature=0.3)
                 summary_text = (result["parsed"].get("summary") or "").strip()[:2000]
                 if not summary_text or len(summary_text) < 40:
                     raise AIClientError(

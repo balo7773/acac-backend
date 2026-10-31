@@ -204,11 +204,21 @@ async def get_submission_evaluation_view(submission_id: int, ctx=Depends(get_jud
     )
     markers = [r["marker"] for r in markers_res.mappings().all() if r["marker"]]
 
+    summary_job_res = await session.execute(
+        text(
+            "SELECT status FROM ai_jobs WHERE submission_id = :sid AND job_type = 'job_b_summary'"
+        ),
+        {"sid": submission_id},
+    )
+    summary_job = summary_job_res.first()
+    summary_pending = summary_job is not None and summary_job.status in ('queued', 'running')
+
     return {
         "submission": dict(sub),
         "bundle": bundle,
         "ai_claims": claims,
         "ai_summary": dict(summary_row) if summary_row else None,
+        "summary_pending": summary_pending,
         "markers": markers,
         "my_essay_scores": essay_scores,
         "my_conclusion_score": dict(conc_score) if conc_score else None,
