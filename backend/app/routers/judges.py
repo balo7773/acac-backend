@@ -82,7 +82,11 @@ async def list_submissions_for_judge(ctx=Depends(get_judge_context)):
                 s.page_count,
                 cw.outcome AS conclusion_outcome,
                 COALESCE(js.status, 'not_started') AS judge_session_status,
-                js.phase_2_expires_at
+                js.phase_2_expires_at,
+                EXISTS(
+                    SELECT 1 FROM ai_evaluations ae
+                    WHERE ae.submission_id = s.id AND 'single_run' = ANY(ae.markers)
+                ) AS has_single_run
             FROM submissions s
             LEFT JOIN conclusion_windows cw ON cw.submission_id = s.id
             LEFT JOIN judge_sessions js ON js.submission_id = s.id AND js.judge_id = current_user_id()
@@ -192,11 +196,20 @@ async def get_submission_evaluation_view(submission_id: int, ctx=Depends(get_jud
     )
     summary_row = summary_res.mappings().first()
 
+    markers_res = await session.execute(
+        text(
+            "SELECT DISTINCT unnest(markers) AS marker FROM ai_evaluations WHERE submission_id = :sid"
+        ),
+        {"sid": submission_id},
+    )
+    markers = [r["marker"] for r in markers_res.mappings().all() if r["marker"]]
+
     return {
         "submission": dict(sub),
         "bundle": bundle,
         "ai_claims": claims,
         "ai_summary": dict(summary_row) if summary_row else None,
+        "markers": markers,
         "my_essay_scores": essay_scores,
         "my_conclusion_score": dict(conc_score) if conc_score else None,
         "flags": flags,
