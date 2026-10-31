@@ -70,7 +70,8 @@ BEGIN
         ('job_b_run', p_submission_id, 'deepseek', 1),
         ('job_b_run', p_submission_id, 'deepseek', 2),
         ('job_b_run', p_submission_id, 'gemma', 1),
-        ('job_b_run', p_submission_id, 'gemma', 2)
+        ('job_b_run', p_submission_id, 'gemma', 2),
+        ('job_b_summary', p_submission_id, 'deepseek', 1)
     ON CONFLICT DO NOTHING;
 
     -- 6. Audit Log
