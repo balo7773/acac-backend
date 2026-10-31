@@ -265,4 +265,14 @@ async def logout(response: Response):
 
 @router.get("/me")
 async def get_me(claims: dict = Depends(get_current_claims)):
-    return claims
+    out = dict(claims)
+    if claims.get("role") == "judge":
+        async with get_rls_session("judge_role", claims["user_id"]) as session:
+            res = await session.execute(
+                text("SELECT judge_type, mask_avatar FROM judges WHERE id = current_user_id()")
+            )
+            row = res.mappings().first()
+            if row:
+                out["judge_type"] = row["judge_type"]
+                out["mask_avatar"] = row["mask_avatar"]
+    return out

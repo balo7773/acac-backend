@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from app.core.config import settings
 from app.core.database import get_rls_session
 from app.core.security import get_candidate_context, get_current_claims
 from app.services.pdf_service import count_words, normalize_canonical_text, process_and_store_pdf
@@ -95,7 +96,21 @@ async def get_candidate_portal(ctx=Depends(get_candidate_context)):
     return dict(row)
 
 
+async def _disqualify(candidate_id: int, reason: str) -> None:
+    """Persist disqualification in a fresh admin session, so it survives even
+    when the calling handler later raises HTTPException (which rolls back its own session)."""
+    from app.core.database import get_rls_session as _get_admin_session
+    async with _get_admin_session("admin_role") as s:
+        await s.execute(
+            text("UPDATE candidates SET is_disqualified = TRUE, "
+                 "disqualification_reason = :r WHERE id = :cid"),
+            {"r": reason, "cid": candidate_id},
+        )
+
+
 @router.post("/upload-draft")
+
+
 async def upload_essay_draft(
     file: UploadFile = File(...),
     ctx=Depends(get_candidate_context),
@@ -155,7 +170,26 @@ async def upload_essay_draft(
         )
 
     pdf_bytes = await file.read()
-    extracted = process_and_store_pdf(pdf_bytes, participant_number=row["participant_number"])
+
+    try:
+        extracted = process_and_store_pdf(pdf_bytes, participant_number=row["participant_number"])
+    except HTTPException as e:
+        # Word-count violation → disqualify (not soft-retry).
+        detail = str(e.detail).lower()
+        if "word" in detail and ("minimum" in detail or "fewer" in detail):
+            await _disqualify(
+                candidate_id,
+                f"Essay contains fewer than {settings.ESSAY_MIN_WORDS} words.",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Your essay was below the {settings.ESSAY_MIN_WORDS}-word minimum "
+                    f"and you have been disqualified from the competition."
+                ),
+            )
+        # Any other PDF issue (invalid format, too large, corrupted) — plain 400, no DQ.
+        raise
 
     violations = scan_candidate_identity(
         canonical_text=extracted.canonical_text,
@@ -164,9 +198,16 @@ async def upload_essay_draft(
         whatsapp_number=row["whatsapp_number"],
     )
     if violations:
+        await _disqualify(
+            candidate_id,
+            f"Essay contains candidate identity markers: {', '.join(violations)}.",
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Anonymity violation: Essay contains candidate identity ({', '.join(violations)}).",
+            detail=(
+                f"Your essay contained candidate identity ({', '.join(violations)}) and "
+                f"you have been disqualified from the competition. The essay must be anonymous."
+            ),
         )
 
     await session.execute(
@@ -192,8 +233,8 @@ async def upload_essay_draft(
     checks = [
         {"check": "filename", "passed": True, "message": f"Filename matches {expected_filename}"},
         {"check": "readable_text", "passed": True, "message": "Text is readable and selectable"},
-        {"check": "pages", "passed": True, "message": f"{extracted.page_count} pages (maximum 5)"},
-        {"check": "words", "passed": True, "message": f"{extracted.word_count} words (minimum 1000)"},
+        {"check": "pages", "passed": True, "message": f"{extracted.page_count} pages"},
+        {"check": "words", "passed": True, "message": f"{extracted.word_count} words (minimum {settings.ESSAY_MIN_WORDS})"},
         {"check": "no_visible_identity", "passed": True, "message": "No identity markers found"},
     ]
 

@@ -16,6 +16,9 @@ from app.services.ai.client import call_deepseek, call_gemma, AIClientError
 from app.services.ai.prompts.job_a_templates import (
     JOB_A_TEMPLATES, JOB_A_PERSONALIZE_PROMPT, choose_template, plain_template
 )
+from app.services.ai.prompts.job_c_templates import (
+    JOB_C_AUDIT_PROMPT, validate_audit_response
+)
 from app.services.pdf_service import locate_verbatim_quote
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -250,6 +253,16 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
         return payload
 
     elif jtype == "job_b_combine":
+        other_model = "gemma" if model_name == "deepseek" else "deepseek"
+        other_res = await session.execute(
+            text(
+                "SELECT 1 FROM ai_evaluations "
+                "WHERE submission_id = :sid AND model_name = :m LIMIT 1"
+            ),
+            {"sid": sid, "m": other_model},
+        )
+        other_has_data = other_res.first() is not None
+
         runs_res = await session.execute(
             text(
                 """
@@ -294,6 +307,9 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
             )
             if ev_status != "verified":
                 markers.append("unverified_quote")
+
+            if not other_has_data:
+                markers.append("single_run")
 
             await session.execute(
                 text(
@@ -383,7 +399,7 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
         res = await session.execute(
             text(
                 """
-                SELECT s.canonical_text, cw.answer_text
+                SELECT s.canonical_text, cw.answer_text, cw.question_text
                 FROM submissions s
                 JOIN conclusion_windows cw ON cw.submission_id = s.id
                 WHERE s.id = :sid
@@ -392,10 +408,20 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
             {"sid": sid},
         )
         row = res.one()
-        ans_lower = (row.answer_text or "").lower()
-        is_contra = "contradict" in ans_lower or "opposite" in ans_lower
-        label = "contradictory" if is_contra else "consistent"
-        ref_mark = 6.0 if is_contra else 24.0
+
+        if settings.AI_MODE == "real":
+            try:
+                audit = await _conclusion_audit_real(
+                    row.canonical_text,
+                    row.question_text,
+                    row.answer_text or "",
+                    model_name,
+                )
+            except (AIClientError, ValueError) as e:
+                logger.warning("Job C real audit failed sid=%s: %s — falling back to stub", sid, e)
+                audit = _conclusion_audit_stub(row.canonical_text, row.answer_text or "")
+        else:
+            audit = _conclusion_audit_stub(row.canonical_text, row.answer_text or "")
 
         await session.execute(
             text(
@@ -404,20 +430,26 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
                     submission_id, model_name, label, essay_quote, conclusion_quote,
                     quotes_verified, addresses_question, reference_mark
                 ) VALUES (
-                    :sid, :mname, :label, :eq, :cq, TRUE, :addr, :rmark
+                    :sid, :mname, :label, :eq, :cq, :qv, :addr, :rmark
                 )
                 ON CONFLICT (submission_id, model_name) DO UPDATE
-                SET label = EXCLUDED.label, reference_mark = EXCLUDED.reference_mark
+                SET label = EXCLUDED.label,
+                    essay_quote = EXCLUDED.essay_quote,
+                    conclusion_quote = EXCLUDED.conclusion_quote,
+                    quotes_verified = EXCLUDED.quotes_verified,
+                    addresses_question = EXCLUDED.addresses_question,
+                    reference_mark = EXCLUDED.reference_mark
                 """
             ),
             {
                 "sid": sid,
                 "mname": model_name,
-                "label": label,
-                "eq": row.canonical_text[:100],
-                "cq": (row.answer_text or "")[:100],
-                "addr": not is_contra,
-                "rmark": ref_mark,
+                "label": audit["label"],
+                "eq": audit["essay_quote"],
+                "cq": audit["conclusion_quote"],
+                "qv": audit["quotes_verified"],
+                "addr": audit["addresses_question"],
+                "rmark": audit["reference_mark"],
             },
         )
 
@@ -431,7 +463,7 @@ async def execute_job(session: AsyncSession, job: dict) -> dict:
             ),
             {"sid": sid},
         )
-        return {"model": model_name, "label": label}
+        return {"model": model_name, "label": audit["label"]}
 
     elif jtype == "job_c_combine":
         audits_res = await session.execute(
@@ -573,7 +605,7 @@ async def process_next_queued_job() -> bool:
                     "backoff": attempts * 15,
                 },
             )
-            logger.error("Job %s failed (attempt %s): %s", job["id"], attempts, exc)
+            logger.exception("Job %s failed (attempt %s): %s", job["id"], attempts, exc)
 
         return True
 
@@ -590,9 +622,6 @@ async def run_worker_forever(poll_interval: float = 2.0):
             logger.error("Worker loop error: %s", e)
         await asyncio.sleep(poll_interval)
 
-
-if __name__ == "__main__":
-    asyncio.run(run_worker_forever())
 
 async def _generate_question_a(sid: int, canonical_text: str, template_id: int, template_str: str) -> tuple[str, str, bool]:
     """Return (question_text, question_source, is_fallback_wording).
@@ -619,6 +648,38 @@ async def _generate_question_a(sid: int, canonical_text: str, template_id: int, 
     except AIClientError as e:
         logger.warning("Job A personalization failed for sid=%s: %s", sid, e)
         return plain_template(template_str), "backup", True
+
+
+def _conclusion_audit_stub(canonical_text: str, answer_text: str) -> dict:
+    """Deterministic stub. Preserves exact prior behavior for tests."""
+    ans_lower = (answer_text or "").lower()
+    is_contra = "contradict" in ans_lower or "opposite" in ans_lower
+    label = "contradictory" if is_contra else "consistent"
+    return {
+        "label": label,
+        "essay_quote": canonical_text[:100],
+        "conclusion_quote": (answer_text or "")[:100],
+        "quotes_verified": True,
+        "addresses_question": not is_contra,
+        "reference_mark": 6.0 if is_contra else 24.0,
+    }
+
+
+async def _conclusion_audit_real(
+    canonical_text: str, question_text: str, answer_text: str, model_name: str
+) -> dict:
+    """Call DeepSeek; verify quotes; return same shape as stub.
+    Raises AIClientError or ValueError on failure so caller can fall back."""
+    if model_name != "deepseek":
+        raise AIClientError(f"Job C only supports deepseek, got {model_name}")
+
+    prompt = JOB_C_AUDIT_PROMPT.format(
+        essay=canonical_text,
+        question=question_text or "(not recorded)",
+        answer=answer_text or "",
+    )
+    result = await call_deepseek(prompt)
+    return validate_audit_response(result["parsed"], canonical_text, answer_text or "")
 
 
 async def _generate_real_eval(model_name: str, run_id: int, canonical_text: str) -> dict:
@@ -663,3 +724,7 @@ async def _generate_real_eval(model_name: str, run_id: int, canonical_text: str)
         "claims": claims_out if run_id == 1 else [],
         "model_version": result["model_version"],
     }
+
+
+if __name__ == "__main__":
+    asyncio.run(run_worker_forever())

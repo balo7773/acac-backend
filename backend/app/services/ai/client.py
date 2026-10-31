@@ -96,8 +96,8 @@ async def call_deepseek(
     prompt: str,
     *,
     temperature: float = 1.0,
-    max_tokens: int = 4000,
-    timeout: float = 60.0,
+    max_tokens: int = 8000,
+    timeout: float = 90.0,
 ) -> dict:
     if not settings.DEEPSEEK_API_KEY:
         raise AIClientError("DEEPSEEK_API_KEY is not configured")

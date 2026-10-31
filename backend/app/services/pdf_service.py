@@ -100,11 +100,12 @@ def process_and_store_pdf(
         )
 
     page_count = doc.page_count
-    if page_count < 1 or page_count > settings.ESSAY_MAX_PAGES:
+    # Page count is recorded but not enforced — word count is the content gate.
+    if page_count < 1:
         doc.close()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"PDF page count ({page_count}) must be between 1 and {settings.ESSAY_MAX_PAGES} pages.",
+            detail="PDF has no pages.",
         )
 
     pages_text = []

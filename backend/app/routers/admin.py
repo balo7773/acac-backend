@@ -234,6 +234,50 @@ async def disqualify_candidate(
     }
 
 
+@router.get("/phase")
+async def get_current_phase(ctx=Depends(get_admin_context)):
+    """Return current competition phase + next allowed phase."""
+    PHASE_CHAIN = [
+        "pre_launch", "stage_1_submitting", "stage_1_grading",
+        "stage_1_review", "finalist_check", "results_published",
+        "stage_2_live", "completed",
+    ]
+    admin_id, session = ctx
+    res = await session.execute(
+        text("SELECT current_phase, stage_1_submission_deadline, "
+             "stage_1_conclusion_closing_time FROM competition_state WHERE id = 1")
+    )
+    row = res.mappings().one()
+    current = row["current_phase"]
+    idx = PHASE_CHAIN.index(current) if current in PHASE_CHAIN else -1
+    next_phase = PHASE_CHAIN[idx + 1] if 0 <= idx < len(PHASE_CHAIN) - 1 else None
+    return {
+        "current_phase": current,
+        "next_phase": next_phase,
+        "stage_1_submission_deadline": row["stage_1_submission_deadline"],
+        "stage_1_conclusion_closing_time": row["stage_1_conclusion_closing_time"],
+    }
+
+
+@router.get("/judges")
+async def list_judges(ctx=Depends(get_admin_context)):
+    """List all judges with id, username, type, mask, active flag."""
+    admin_id, session = ctx
+    res = await session.execute(
+        text(
+            "SELECT id, username, judge_type, mask_avatar, is_active, "
+            "deactivated_at, deactivation_reason "
+            "FROM judges ORDER BY id ASC"
+        )
+    )
+    rows = [dict(r) for r in res.mappings().all()]
+    # Serialize datetimes to ISO for JSON
+    for r in rows:
+        if r.get("deactivated_at") is not None and not isinstance(r["deactivated_at"], str):
+            r["deactivated_at"] = r["deactivated_at"].isoformat()
+    return {"judges": rows, "count": len(rows)}
+
+
 class SettingsUpdateRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
 

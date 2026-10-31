@@ -69,6 +69,6 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO admins (username, password_hash)
 VALUES (
     'admin',
-    '$argon2id$v=19$m=65536,t=3,p=4$06Hc2eM+ySMDwzyRxyIVrg$o/wTjIIN+KQx6/zi8Z6u6rnXVHqOln/3nVkrmSY20V0'
+    '$argon2id$v=19$m=65536,t=3,p=4$NXWluTRb/esWFrnHX2XwdQ$q6P+/PmWm8P0WNCzoo6R0ewc7X1AEAKet7gCVGctXwk'
 )
 ON CONFLICT (username) DO NOTHING;

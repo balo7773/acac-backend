@@ -1,3 +1,6 @@
+import os
+os.environ["AI_MODE"] = "stub"  # tests must not call real AI providers
+
 import pytest
 from sqlalchemy import text
 from app.core.database import engine, get_rls_session
@@ -31,6 +34,10 @@ async def reset_competition_phase():
         # Clean scoring artifacts so tests start from a clean computation state
         await session.execute(text("DELETE FROM finalist_checks"))
         await session.execute(text("DELETE FROM finalists"))
+        # Reset settings: keep only version 1 (seed), activate it.
+        # Tests that add versions via PUT /settings must not leak across runs.
+        await session.execute(text("DELETE FROM settings WHERE version <> 1"))
+        await session.execute(text("UPDATE settings SET is_active = TRUE WHERE version = 1"))
         await session.execute(text("DELETE FROM stage1_results"))
         await session.execute(text("DELETE FROM judge_sessions"))
     yield

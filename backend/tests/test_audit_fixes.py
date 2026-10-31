@@ -126,6 +126,18 @@ async def test_fix_1_1_essay_text_does_not_leak_and_requires_open_full(tmp_path,
         assert "canonical_text" not in data["submission"]
         assert secret_key not in json.dumps(data)
 
+        # Set defense outcome to 'auto_zero' — the new essay-lock gate (2.9c)
+        # unlocks the essay once the defense window is closed. 'auto_zero' is
+        # valid without requiring question_text/answer_text (unlike 'answered'),
+        # and semantically means "defense over", which is exactly what the gate
+        # checks for. The test cares about the gate, not whether the candidate
+        # answered or timed out.
+        async with get_rls_session("admin_role") as session:
+            await session.execute(
+                text("UPDATE conclusion_windows SET outcome = 'auto_zero' WHERE submission_id = :sid"),
+                {"sid": sub_id},
+            )
+
         # Verification 2: Explicitly call open-full -> returns canonical_text and records opened_full_essay
         open_res = await client.post(f"/api/judge/submissions/{sub_id}/open-full", headers=judge_headers)
         assert open_res.status_code == 200
@@ -384,45 +396,132 @@ async def test_fix_2_2_upload_validations_and_identity_scan(tmp_path, monkeypatc
                 text("UPDATE competition_state SET stage_1_submission_deadline = NULL WHERE id = 1")
             )
 
-        # Check 4: Identity check - Candidate Name part in text rejected
+        # Identity checks each DQ their candidate, so use a fresh one per case.
+        # This isolates the tests from cross-contamination via is_disqualified.
+
+        async def _fresh_candidate(full_name: str) -> tuple[int, str, str]:
+            """Register a new candidate and return (participant_number, matric, phone)."""
+            sfx2 = uuid.uuid4().hex[:6]
+            r = await client.post(
+                "/api/auth/register",
+                json={
+                    "full_name": full_name,
+                    "matric_number": f"AFIT/ID/{sfx2}",
+                    "whatsapp_number": f"+2348{sfx2[:6]}00",
+                    "linkedin_url": "https://linkedin.com/in/id",
+                    "password": "Password123!",
+                },
+            )
+            assert r.status_code == 201, r.text
+            body = r.json()
+            # Extract the storage values the handler uses — matric uppercase, name in body
+            return body["participant_number"], f"AFIT/ID/{sfx2}".upper(), f"+2348{sfx2[:6]}00"
+
+        # Check 4: Name in text -> DQ
+        pno4, _, _ = await _fresh_candidate("Tariq Idris")
+        cand4_headers = {"Authorization": f"Bearer {_extract_cookie_val(r_reg := None)}"} if False else None
+        # Simpler: use the shared test's client but register fresh candidates
+        # Each identity test re-registers, gets its own cookie via client state (the _clear_hook resets it)
+        # Actually — we rely on cookies, so re-registering overwrites the session cookie.
+        # Strategy: register a fresh candidate, hit the endpoint before another register.
+
+        # Check 4 — Tariq (name)
+        sfx4 = uuid.uuid4().hex[:6]
+        reg4 = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Tariq Idris",
+                "matric_number": f"AFIT/NM/{sfx4}",
+                "whatsapp_number": f"+2348{sfx4[:6]}44",
+                "linkedin_url": "https://linkedin.com/in/tq",
+                "password": "Password123!",
+            },
+        )
+        assert reg4.status_code == 201, reg4.text
+        pno4 = reg4.json()["participant_number"]
+        h4 = {"Authorization": f"Bearer {_extract_cookie_val(reg4)}"}
         name_pdf = _make_custom_pdf("Authored by Tariq for review")
         name_res = await client.post(
             "/api/candidate/upload-draft",
-            files={"file": (f"{pno}.pdf", name_pdf, "application/pdf")},
-            headers=headers,
+            files={"file": (f"{pno4}.pdf", name_pdf, "application/pdf")},
+            headers=h4,
         )
-        assert name_res.status_code == 400
-        assert "Anonymity violation" in name_res.json()["detail"]
+        assert name_res.status_code == 400, name_res.text
+        assert "candidate identity" in name_res.json()["detail"]
         assert "tariq" in name_res.json()["detail"].lower()
 
-        # Check 5: Identity check - Matric Number in text rejected
-        matric_pdf = _make_custom_pdf(f"Student ID: {matric}")
+        # Check 5 — Matric
+        sfx5 = uuid.uuid4().hex[:6]
+        matric5 = f"AFIT/MC/{sfx5}".upper()
+        reg5 = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Neutral Name Five",
+                "matric_number": f"AFIT/MC/{sfx5}",
+                "whatsapp_number": f"+2348{sfx5[:6]}55",
+                "linkedin_url": "https://linkedin.com/in/mc",
+                "password": "Password123!",
+            },
+        )
+        assert reg5.status_code == 201, reg5.text
+        pno5 = reg5.json()["participant_number"]
+        h5 = {"Authorization": f"Bearer {_extract_cookie_val(reg5)}"}
+        matric_pdf = _make_custom_pdf(f"Student ID: {matric5}")
         matric_res = await client.post(
             "/api/candidate/upload-draft",
-            files={"file": (f"{pno}.pdf", matric_pdf, "application/pdf")},
-            headers=headers,
+            files={"file": (f"{pno5}.pdf", matric_pdf, "application/pdf")},
+            headers=h5,
         )
-        assert matric_res.status_code == 400
-        assert "matric number" in matric_res.json()["detail"].lower()
+        assert matric_res.status_code == 400, matric_res.text
+        assert "candidate identity" in matric_res.json()["detail"].lower() or "matric" in matric_res.json()["detail"].lower()
 
-        # Check 6: Identity check - Phone Number in text rejected
-        phone_pdf = _make_custom_pdf(f"Contact telephone: {phone}")
+        # Check 6 — Phone
+        sfx6 = uuid.uuid4().hex[:6]
+        phone6 = f"+2348{sfx6[:6]}66"
+        reg6 = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Neutral Name Six",
+                "matric_number": f"AFIT/PH/{sfx6}",
+                "whatsapp_number": phone6,
+                "linkedin_url": "https://linkedin.com/in/ph",
+                "password": "Password123!",
+            },
+        )
+        assert reg6.status_code == 201, reg6.text
+        pno6 = reg6.json()["participant_number"]
+        h6 = {"Authorization": f"Bearer {_extract_cookie_val(reg6)}"}
+        phone_pdf = _make_custom_pdf(f"Contact telephone: {phone6}")
         phone_res = await client.post(
             "/api/candidate/upload-draft",
-            files={"file": (f"{pno}.pdf", phone_pdf, "application/pdf")},
-            headers=headers,
+            files={"file": (f"{pno6}.pdf", phone_pdf, "application/pdf")},
+            headers=h6,
         )
-        assert phone_res.status_code == 400
-        assert "phone" in phone_res.json()["detail"].lower()
+        assert phone_res.status_code == 400, phone_res.text
+        assert "candidate identity" in phone_res.json()["detail"].lower() or "phone" in phone_res.json()["detail"].lower()
 
-        # Check 7: Text containing "AFIT" passes and returns pre-flight checks
+        # Check 7 — "AFIT" alone passes (fresh candidate, no DQ)
+        sfx7 = uuid.uuid4().hex[:6]
+        reg7 = await client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Neutral Name Seven",
+                "matric_number": f"AFIT/OK/{sfx7}",
+                "whatsapp_number": f"+2348{sfx7[:6]}77",
+                "linkedin_url": "https://linkedin.com/in/ok",
+                "password": "Password123!",
+            },
+        )
+        assert reg7.status_code == 201, reg7.text
+        pno7 = reg7.json()["participant_number"]
+        h7 = {"Authorization": f"Bearer {_extract_cookie_val(reg7)}"}
         afit_pdf = _make_custom_pdf("This academic paper examines AFIT institutional fiscal policies in Nigeria.")
         ok_res = await client.post(
             "/api/candidate/upload-draft",
-            files={"file": (f"{pno}.pdf", afit_pdf, "application/pdf")},
-            headers=headers,
+            files={"file": (f"{pno7}.pdf", afit_pdf, "application/pdf")},
+            headers=h7,
         )
-        assert ok_res.status_code == 200
+        assert ok_res.status_code == 200, ok_res.text
         data = ok_res.json()
         assert data["status"] == "draft"
         assert len(data["checks"]) == 5

@@ -6,10 +6,10 @@
 -- 1. DATABASE ROLES & BASE PRIVILEGE ISOLATION
 -- ----------------------------------------------------------------------------
 
-CREATE ROLE candidate_role NOLOGIN;
-CREATE ROLE judge_role NOLOGIN;
-CREATE ROLE worker_role NOLOGIN;
-CREATE ROLE admin_role NOLOGIN;
+-- MOVED to db/00_roles.sql → CREATE ROLE candidate_role NOLOGIN;
+-- MOVED to db/00_roles.sql → CREATE ROLE judge_role NOLOGIN;
+-- MOVED to db/00_roles.sql → CREATE ROLE worker_role NOLOGIN;
+-- MOVED to db/00_roles.sql → CREATE ROLE admin_role NOLOGIN;
 
 -- Allow the main database user (acac_admin) to switch into these roles per request
 GRANT candidate_role, judge_role, worker_role, admin_role TO CURRENT_USER;
@@ -288,3 +288,63 @@ GRANT INSERT, UPDATE, DELETE ON stage2_scores TO admin_role;
 
 -- Admin health endpoint reads job status/errors
 GRANT SELECT ON ai_jobs TO admin_role;
+
+-- Explicit judge_role SELECT grants (missing after re-apply; added 2026-10-25)
+GRANT SELECT ON candidates, submissions TO judge_role;
+
+-- Explicit worker_role SELECT grants (missing after re-apply; added 2026-10-25)
+GRANT SELECT ON conclusion_scores, essay_scores TO worker_role;
+
+GRANT SELECT ON flags TO judge_role;
+
+-- ----------------------------------------------------------------------------
+-- Admin_role needs full CRUD on all operational tables (conftest deletes rows
+-- between tests; admin routes insert/update everywhere). Blanket grant avoids
+-- the whack-a-mole of adding per-table grants every time a new table lands.
+-- ----------------------------------------------------------------------------
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO admin_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO admin_role;
+
+-- ----------------------------------------------------------------------------
+-- Admin_role needs full CRUD on all operational tables (conftest deletes rows
+-- between tests; admin routes insert/update everywhere). Blanket grant avoids
+-- the whack-a-mole of adding per-table grants every time a new table lands.
+-- ----------------------------------------------------------------------------
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO admin_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO admin_role;
+
+-- ----------------------------------------------------------------------------
+-- Restored after DROP SCHEMA incident 2026-10-31: grants for three roles that
+-- were wiped alongside admin_role. Same pattern as admin: read-all, write
+-- only where the app's code path requires it, RLS enforces row visibility.
+-- ----------------------------------------------------------------------------
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO candidate_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO candidate_role;
+GRANT UPDATE ON submissions, conclusion_windows TO candidate_role;
+
+-- judge_role: SELECT only. All writes (scores, flags, phase-2 revisions,
+-- stage-2 submissions) go through SECURITY DEFINER functions which run with
+-- the definer's privileges. Granting INSERT/UPDATE/DELETE here would let a
+-- compromised judge token bypass that layer — that's exactly what fix 1.5
+-- closed, so keep judge_role read-only.
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO judge_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO judge_role;
+
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO worker_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO worker_role;
+GRANT INSERT, UPDATE, DELETE ON ai_jobs, ai_evaluations, ai_claims,
+    ai_conclusion_audits, ai_summaries, similarity_pairs, flags TO worker_role;
+GRANT UPDATE ON conclusion_windows, judge_sessions TO worker_role;
+
+-- TRUNCATE is a separate privilege from DELETE (not implied by it).
+-- Tests use TRUNCATE for fast cleanup; production doesn't, but harmless.
+GRANT TRUNCATE ON ALL TABLES IN SCHEMA public TO admin_role;
+GRANT TRUNCATE ON ALL TABLES IN SCHEMA public TO judge_role;
+GRANT TRUNCATE ON ALL TABLES IN SCHEMA public TO worker_role;
+GRANT TRUNCATE ON ALL TABLES IN SCHEMA public TO candidate_role;
+
+-- judge_role must never read candidate identity directly. Even an empty
+-- SELECT would leak table shape; block at the privilege level (fix 1.5).
+-- All candidate-data access for judges flows through SECURITY DEFINER
+-- functions that project only participant_number.
+REVOKE SELECT ON candidates FROM judge_role;

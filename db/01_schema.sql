@@ -194,6 +194,14 @@ CREATE TABLE ai_claims (
     quote_end INT
 );
 
+
+CREATE TABLE IF NOT EXISTS ai_summaries (
+    submission_id INT PRIMARY KEY REFERENCES submissions(id) ON DELETE CASCADE,
+    summary_text TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE ai_conclusion_audits (
     id SERIAL PRIMARY KEY,
     submission_id INT NOT NULL REFERENCES submissions(id),

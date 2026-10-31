@@ -63,12 +63,12 @@ def test_fix_2_1_page_and_word_limits(tmp_path, monkeypatch):
     from app.core import config
     monkeypatch.setattr(config.settings, "UPLOAD_DIR", str(tmp_path))
 
-    # 6-page PDF rejected
-    pdf_6_pages = _make_pdf(num_pages=6, words_per_page=200)
-    with pytest.raises(HTTPException) as exc1:
-        process_and_store_pdf(pdf_6_pages, participant_number=1002)
-    assert exc1.value.status_code == 400
-    assert "between 1 and 5 pages" in exc1.value.detail
+    # NOTE: page-count maximum removed 2026-10-24. Word count is the content gate.
+    # 6-page PDF with >=1000 words should now be accepted.
+    pdf_6_pages = _make_pdf(num_pages=6, words_per_page=200)  # 1200 words
+    res_6p = process_and_store_pdf(pdf_6_pages, participant_number=1002)
+    assert res_6p.page_count == 6
+    assert res_6p.word_count >= 1000
 
     # 800-word PDF rejected (< 1000)
     doc = fitz.open()
