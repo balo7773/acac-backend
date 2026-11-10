@@ -30,7 +30,7 @@ def get_password_hash(password: str) -> str:
     return password_hash.hash(password)
 
 
-def create_access_token(user_id: int, role: str, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(user_id: int, role: str, token_version: int = 0, expires_delta: Optional[timedelta] = None) -> str:
     if role not in ROLE_TO_DB_ROLE:
         raise ValueError(f"Unsupported user role: {role}")
 
@@ -41,6 +41,7 @@ def create_access_token(user_id: int, role: str, expires_delta: Optional[timedel
         "sub": str(user_id),
         "role": role,
         "db_role": ROLE_TO_DB_ROLE[role],
+        "tv": token_version,
         "exp": expire,
     }
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
@@ -57,7 +58,7 @@ def decode_access_token(token: str) -> dict:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication claims.",
             )
-        return {"user_id": user_id, "role": role, "db_role": db_role}
+        return {"user_id": user_id, "role": role, "db_role": db_role, "tv": payload.get("tv", -1)}
     except (jwt.PyJWTError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -65,7 +66,7 @@ def decode_access_token(token: str) -> dict:
         )
 
 
-def get_current_claims(
+async def get_current_claims(
     acac_session: Optional[str] = Cookie(default=None),
     authorization: Optional[str] = Header(default=None),
 ) -> dict:
@@ -78,7 +79,29 @@ def get_current_claims(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required.",
         )
-    return decode_access_token(token)
+    
+    claims = decode_access_token(token)
+    
+    # Verify token_version (single device login)
+    user_id = claims["user_id"]
+    role = claims["role"]
+    table = {"candidate": "candidates", "judge": "judges", "admin": "admins"}.get(role)
+    if not table:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid role.")
+        
+    async with get_rls_session("admin_role") as session:
+        res = await session.execute(
+            text(f"SELECT token_version FROM {table} WHERE id = :id"),
+            {"id": user_id}
+        )
+        row = res.first()
+        if not row or row.token_version != claims.get("tv", -1):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired due to a login on another device."
+            )
+    
+    return claims
 
 
 async def get_candidate_context(

@@ -989,3 +989,150 @@ async def decide_similarity_pair(pair_id: int, payload: SimilarityDecisionReques
         {"aid": admin_id, "pid": pair_id, "det": json.dumps({"decision": payload.decision})},
     )
     return dict(row)
+
+class ResolveComplaintRequest(BaseModel):
+    reply: str = Field(..., min_length=5, max_length=2000)
+
+
+@router.get("/complaints")
+async def list_complaints(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    res = await session.execute(
+        text("""
+            SELECT c.id, c.subject, c.message, c.status, c.admin_reply, c.created_at,
+                   cand.participant_number, cand.full_name
+            FROM complaints c
+            JOIN candidates cand ON cand.id = c.candidate_id
+            ORDER BY c.created_at DESC
+        """)
+    )
+    return [dict(r) for r in res.mappings().all()]
+
+
+@router.post("/complaints/{complaint_id}/resolve")
+async def resolve_complaint(
+    complaint_id: int,
+    payload: ResolveComplaintRequest,
+    ctx=Depends(get_admin_context),
+):
+    admin_id, session = ctx
+    await session.execute(
+        text("""
+            UPDATE complaints
+            SET status = 'resolved', admin_reply = :reply, resolved_at = NOW()
+            WHERE id = :id
+        """),
+        {"id": complaint_id, "reply": payload.reply},
+    )
+    return {"status": "resolved"}
+
+@router.get("/similarity-pairs/{pair_id}/details")
+async def get_similarity_details(pair_id: int, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    res = await session.execute(
+        text("""
+            SELECT sp.submission_a_id AS submission_id_a, sp.submission_b_id AS submission_id_b,
+                   s_a.canonical_text AS text_a, s_b.canonical_text AS text_b,
+                   c_a.participant_number AS pno_a, c_b.participant_number AS pno_b
+            FROM similarity_pairs sp
+            JOIN submissions s_a ON s_a.id = sp.submission_a_id
+            JOIN submissions s_b ON s_b.id = sp.submission_b_id
+            JOIN candidates c_a ON c_a.id = s_a.candidate_id
+            JOIN candidates c_b ON c_b.id = s_b.candidate_id
+            WHERE sp.id = :pid
+        """),
+        {"pid": pair_id},
+    )
+    row = res.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="Pair not found")
+    return dict(row)
+
+class PenaltyRequest(BaseModel):
+    points: int = Field(..., ge=5, le=20)
+    reason: str = Field(..., min_length=3, max_length=500)
+
+@router.post("/submissions/{submission_id}/penalty")
+async def apply_penalty(submission_id: int, payload: PenaltyRequest, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    await session.execute(
+        text("""
+            INSERT INTO manual_penalties (submission_id, points_deducted, reason)
+            VALUES (:sid, :pts, :reason)
+        """),
+        {"sid": submission_id, "pts": payload.points, "reason": payload.reason},
+    )
+    await session.execute(text("SELECT compute_stage1_results()"))
+    return {"status": "penalty_applied"}
+
+class SimilarityDecisionRequest(BaseModel):
+    decision: str
+
+@router.post("/similarity-pairs/{pair_id}/decision")
+async def decide_similarity_pair(pair_id: int, payload: SimilarityDecisionRequest, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    if payload.decision not in ('cleared', 'confirmed_violation', 'penalty_applied'):
+        raise HTTPException(400, detail="Invalid decision")
+        
+    # Get the submissions involved
+    res = await session.execute(
+        text("SELECT submission_a_id, submission_b_id FROM similarity_pairs WHERE id = :pid"),
+        {"pid": pair_id}
+    )
+    pair = res.first()
+    if not pair:
+        raise HTTPException(404, detail="Pair not found")
+
+    # Update the similarity flag
+    await session.execute(
+        text("UPDATE similarity_pairs SET admin_decision = :dec WHERE id = :pid"),
+        {"dec": payload.decision, "pid": pair_id}
+    )
+
+    # If confirmed violation, disqualify BOTH candidates
+    if payload.decision == 'confirmed_violation':
+        await session.execute(
+            text("""
+                UPDATE candidates SET is_disqualified = TRUE, disqualification_reason = 'Similarity plagiarism confirmed'
+                WHERE id IN (
+                    SELECT candidate_id FROM submissions WHERE id IN (:a, :b)
+                )
+            """),
+            {"a": pair.submission_a_id, "b": pair.submission_b_id}
+        )
+        # Recompute leaderboard to remove them
+        await session.execute(text("SELECT compute_stage1_results()"))
+    
+    return {"status": "success"}
+
+@router.get("/candidates")
+async def list_all_candidates(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    res = await session.execute(
+        text("""
+            SELECT c.id, c.participant_number, c.full_name, c.matric_number, c.is_disqualified, c.disqualification_reason,
+                   s.id AS submission_id, s.status AS submission_status,
+                   sr.composite_score,
+                   (SELECT COUNT(DISTINCT judge_id) FROM judge_sessions WHERE submission_id = s.id AND status = 'locked_final') AS judges_scored,
+                   (SELECT COUNT(*) FROM judges WHERE is_active = TRUE) AS total_active_judges,
+                   (SELECT COUNT(*) FROM complaints WHERE candidate_id = c.id AND status = 'open') AS open_complaints
+            FROM candidates c
+            JOIN submissions s ON s.candidate_id = c.id
+            LEFT JOIN stage1_results sr ON sr.submission_id = s.id
+            ORDER BY judges_scored DESC, sr.composite_score DESC NULLS LAST, c.participant_number ASC
+        """)
+    )
+    return [dict(r) for r in res.mappings().all()]
+
+@router.get("/candidates/{submission_id}/essay")
+async def get_candidate_essay(submission_id: int, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    res = await session.execute(
+        text("SELECT canonical_text FROM submissions WHERE id = :sid"),
+        {"sid": submission_id}
+    )
+    row = res.first()
+    if not row:
+        raise HTTPException(404, detail="Submission not found")
+    return {"text": row.canonical_text}
+

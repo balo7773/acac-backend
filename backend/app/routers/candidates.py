@@ -20,6 +20,11 @@ FALLBACK_QUESTIONS = [
 ]
 
 
+class ComplaintRequest(BaseModel):
+    subject: str = Field(..., min_length=3, max_length=255)
+    message: str = Field(..., min_length=10, max_length=2000)
+
+
 class FinalSubmitRequest(BaseModel):
     accepted_rules: bool = Field(default=False, description="Explicit agreement to competition rules")
     rules_version: str = Field(default="v1.0", min_length=1, max_length=30)
@@ -501,4 +506,19 @@ async def get_verdict(claims: dict = Depends(get_current_claims)):
 
         res = await session.execute(text("SELECT fn_get_candidate_verdict()"))
         return res.scalar_one()
+
+@router.post("/complaints")
+async def submit_complaint(
+    payload: ComplaintRequest,
+    ctx=Depends(get_candidate_context),
+):
+    candidate_id, session = ctx
+    await session.execute(
+        text("""
+            INSERT INTO complaints (candidate_id, subject, message)
+            VALUES (:cid, :sub, :msg)
+        """),
+        {"cid": candidate_id, "sub": payload.subject, "msg": payload.message},
+    )
+    return {"status": "submitted", "message": "Your complaint has been received by the admin."}
 

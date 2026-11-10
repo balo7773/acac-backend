@@ -276,3 +276,12 @@ async def get_me(claims: dict = Depends(get_current_claims)):
                 out["judge_type"] = row["judge_type"]
                 out["mask_avatar"] = row["mask_avatar"]
     return out
+
+@router.get("/public-phase")
+async def get_public_phase():
+    async with get_rls_session("admin_role") as session:
+        res = await session.execute(
+            text("SELECT current_phase FROM competition_state WHERE id = 1")
+        )
+        phase = res.scalar_one_or_none()
+        return {"current_phase": phase}
