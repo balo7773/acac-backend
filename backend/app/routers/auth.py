@@ -165,8 +165,7 @@ async def login(payload: LoginRequest, request: Request, response: Response):
             res = await session.execute(
                 text(
                     """
-                    SELECT id, participant_number, full_name, password_hash, is_disqualified
-                    FROM candidates
+                    SELECT id, participant_number, full_name, password_hash, is_disqualified, must_change_password FROM candidates
                     WHERE participant_number = :pno
                     """
                 ),
@@ -190,11 +189,12 @@ async def login(payload: LoginRequest, request: Request, response: Response):
             else:
                 display_name = f"Candidate #{row.participant_number}"
                 user_id = row.id
+                is_temp = bool(row.must_change_password)
 
         elif payload.role == "judge":
             res = await session.execute(
                 text(
-                    "SELECT id, username, mask_avatar, password_hash, is_active "
+                    "SELECT id, username, mask_avatar, judge_type, password_hash, is_active "
                     "FROM judges WHERE lower(username) = :uname"
                 ),
                 {"uname": ident.lower()},
@@ -215,8 +215,17 @@ async def login(payload: LoginRequest, request: Request, response: Response):
                     detail="Judge account is currently inactive.",
                 )
             else:
-                display_name = row.username
+                mask_map = {
+                    "mask_owl": "Judge 1",
+                    "mask_falcon": "Judge 2",
+                    "mask_lion": "Judge 3",
+                    "mask_panther": "Judge 4"
+                }
+                display_name = mask_map.get(row.mask_avatar, row.username)
                 user_id = row.id
+                is_temp = False
+                judge_type = row.judge_type
+                mask_avatar = row.mask_avatar  # Judges NEVER get temp passwords
 
         else:  # admin
             res = await session.execute(
@@ -236,6 +245,7 @@ async def login(payload: LoginRequest, request: Request, response: Response):
             else:
                 display_name = row.username
                 user_id = row.id
+                is_temp = False
 
         # 3. Clear failed attempts for this identifier on successful login
         if auth_error is None:
@@ -254,6 +264,9 @@ async def login(payload: LoginRequest, request: Request, response: Response):
         "user_id": user_id,
         "role": payload.role,
         "display_name": display_name,
+        "must_change_password": is_temp,
+        "judge_type": locals().get("judge_type", None),
+        "mask_avatar": locals().get("mask_avatar", None),
     }
 
 
@@ -275,6 +288,14 @@ async def get_me(claims: dict = Depends(get_current_claims)):
             if row:
                 out["judge_type"] = row["judge_type"]
                 out["mask_avatar"] = row["mask_avatar"]
+    elif claims.get("role") == "candidate":
+        async with get_rls_session("candidate_role", claims["user_id"]) as session:
+            res = await session.execute(
+                text("SELECT must_change_password FROM candidates WHERE id = current_user_id()")
+            )
+            row = res.first()
+            if row:
+                out["must_change_password"] = row.must_change_password
     return out
 
 @router.get("/public-phase")
@@ -285,3 +306,23 @@ async def get_public_phase():
         )
         phase = res.scalar_one_or_none()
         return {"current_phase": phase}
+
+from pydantic import BaseModel, Field
+
+class ChangePasswordRequest(BaseModel):
+    new_password: str = Field(..., min_length=8)
+
+@router.post("/change-password")
+async def change_password(payload: ChangePasswordRequest, claims: dict = Depends(get_current_claims)):
+    from app.core.security import get_password_hash
+    user_id = claims["user_id"]
+    role = claims["role"]
+    table = {"candidate": "candidates", "judge": "judges", "admin": "admins"}.get(role)
+    
+    async with get_rls_session("admin_role") as session:
+        await session.execute(
+            text(f"UPDATE {table} SET password_hash = :hash, must_change_password = FALSE WHERE id = :id"),
+            {"hash": get_password_hash(payload.new_password), "id": user_id}
+        )
+    return {"status": "success"}
+

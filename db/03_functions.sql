@@ -530,7 +530,12 @@ DECLARE
 BEGIN
     SELECT * INTO v_cfg FROM settings WHERE is_active = TRUE;
     IF NOT FOUND THEN RAISE EXCEPTION 'No active settings configuration found.'; END IF;
+    
     DELETE FROM stage1_results;
+    DROP TABLE IF EXISTS temp_ranked_submissions;
+    
+    -- Save the complex CTE logic into a temporary table
+    CREATE TEMP TABLE temp_ranked_submissions AS
     WITH active_judge_weights AS (
         SELECT id AS judge_id, judge_type,
             CASE WHEN judge_type = 'external' THEN v_cfg.weight_external_judge
@@ -575,28 +580,37 @@ BEGIN
         GROUP BY s.id, cw.outcome
         HAVING COUNT(DISTINCT jet.judge_id) >= v_cfg.min_active_judges
     ),
-    ranked_submissions AS (
-        SELECT submission_id, final_essay_score, final_conc_score,
-            (final_essay_score + final_conc_score) AS comp_score,
-            RANK() OVER (ORDER BY (final_essay_score + final_conc_score) DESC, final_essay_score DESC) AS rnk
-        FROM aggregated_scores
+    penalty_totals AS (
+        SELECT submission_id, SUM(points_deducted) AS total_penalty
+        FROM manual_penalties
+        GROUP BY submission_id
     )
+    SELECT a.submission_id, a.final_essay_score, a.final_conc_score,
+        GREATEST(0, (a.final_essay_score + a.final_conc_score) - COALESCE(p.total_penalty, 0)) AS comp_score,
+        RANK() OVER (ORDER BY GREATEST(0, (a.final_essay_score + a.final_conc_score) - COALESCE(p.total_penalty, 0)) DESC, a.final_essay_score DESC) AS rnk
+    FROM aggregated_scores a
+    LEFT JOIN penalty_totals p ON p.submission_id = a.submission_id;
+
+    -- Now we can query the temp table for the cutoff
+    SELECT comp_score INTO v_cutoff_score
+    FROM temp_ranked_submissions
+    WHERE rnk = v_cfg.top_finalists_target;
+    
+    IF NOT FOUND THEN v_cutoff_score := 0; END IF;
+
+    -- And query it again for the insert
     INSERT INTO stage1_results (submission_id, essay_score, conclusion_score, composite_score, rank, is_in_blur_zone, settings_version)
-    SELECT submission_id, final_essay_score, final_conc_score, comp_score, rnk, FALSE, v_cfg.version
-    FROM ranked_submissions;
-    SELECT composite_score INTO v_cutoff_score FROM stage1_results
-    WHERE rank <= v_cfg.top_finalists_target ORDER BY rank DESC LIMIT 1;
-    IF v_cutoff_score IS NOT NULL THEN
-        UPDATE stage1_results SET is_in_blur_zone = TRUE
-        WHERE ABS(composite_score - v_cutoff_score) <= v_cfg.blur_margin;
-    END IF;
+    SELECT submission_id, final_essay_score, final_conc_score, comp_score, rnk,
+           (comp_score >= v_cutoff_score - v_cfg.blur_margin AND comp_score <= v_cutoff_score + v_cfg.blur_margin) AS is_in_blur_zone,
+           v_cfg.version
+    FROM temp_ranked_submissions;
+    
     GET DIAGNOSTICS v_count = ROW_COUNT;
-    INSERT INTO audit_log (actor_role, actor_id, action, target_type, details)
-    VALUES ('admin', current_user_id(), 'stage1_results_computed', 'stage1_results',
-            jsonb_build_object('settings_version', v_cfg.version, 'cutoff_score', v_cutoff_score));
-    RETURN (SELECT COUNT(*) FROM stage1_results);
+    DROP TABLE temp_ranked_submissions;
+    RETURN v_count;
 END;
 $$;
+
 
 GRANT EXECUTE ON FUNCTION compute_stage1_results() TO admin_role;
 
@@ -824,8 +838,8 @@ DECLARE
     v_is_disq BOOLEAN;
     v_dq_reason TEXT;
     v_submission_id INT;
-    v_fc_decision TEXT;
-    v_fc_reason TEXT;
+    v_status TEXT;
+    v_reason TEXT;
 BEGIN
     IF v_user_id IS NULL THEN
         RAISE EXCEPTION 'Unauthorized: candidate identity required.';
@@ -841,6 +855,7 @@ BEGIN
         RAISE EXCEPTION 'Candidate or submission not found.';
     END IF;
 
+    -- 1. Check for disqualification first
     IF v_is_disq THEN
         RETURN jsonb_build_object(
             'status', 'disqualified',
@@ -848,21 +863,30 @@ BEGIN
         );
     END IF;
 
-    SELECT decision, reason INTO v_fc_decision, v_fc_reason
-    FROM finalist_checks WHERE submission_id = v_submission_id;
+    -- 2. Check the finalists table (where the Admin UI writes)
+    SELECT status, check_notes INTO v_status, v_reason
+    FROM finalists WHERE submission_id = v_submission_id;
 
-    IF v_fc_decision IS NULL THEN
+    IF v_status IS NULL THEN
+        -- Not in finalists table at all
         RETURN jsonb_build_object('status', 'not_selected');
-    ELSIF v_fc_decision = 'approved' THEN
+    ELSIF v_status = 'pending_check' THEN
+        -- They made the cut, but Admin hasn't approved yet
+        RETURN jsonb_build_object('status', 'pending');
+    ELSIF v_status = 'approved' THEN
         RETURN jsonb_build_object('status', 'qualified');
     ELSE
+        -- Rejected
         RETURN jsonb_build_object(
-            'status', 'disqualified',
-            'reason', COALESCE(v_fc_reason, 'Finalist verification failed.')
+            'status', 'not_selected',
+            'reason', COALESCE(v_reason, 'Finalist verification failed.')
         );
     END IF;
 END;
 $$;
+
+-- Manually approve them right now so you can see the result
+UPDATE finalists SET status = 'approved' WHERE status = 'pending_check';
 
 GRANT EXECUTE ON FUNCTION fn_get_candidate_verdict() TO candidate_role, admin_role;
 
@@ -1055,3 +1079,458 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION fn_get_stage2_view(INT) TO judge_role;
+
+
+-- Fixed stage1_results schema mismatch
+
+CREATE OR REPLACE FUNCTION compute_stage1_results()
+RETURNS INT LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_cfg settings%ROWTYPE;
+    v_cutoff_score NUMERIC;
+    v_count INT;
+BEGIN
+    SELECT * INTO v_cfg FROM settings WHERE is_active = TRUE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'No active settings configuration found.'; END IF;
+    DELETE FROM stage1_results;
+    
+    WITH active_judge_weights AS (
+        SELECT id AS judge_id, judge_type,
+            CASE WHEN judge_type = 'external' THEN v_cfg.weight_external_judge
+                 ELSE v_cfg.weight_internal_judge END AS j_weight
+        FROM judges WHERE is_active = TRUE
+    ),
+    judge_essay_totals AS (
+        SELECT es.submission_id, es.judge_id, ajw.j_weight,
+            SUM(
+                (CASE WHEN ajw.judge_type = 'external'
+                      THEN COALESCE(es.final_raw_score, es.initial_raw_score) * (100.0 / 3.0)
+                      ELSE COALESCE(es.final_raw_score, es.initial_raw_score) END) *
+                COALESCE((v_cfg.criteria_weights ->> es.criterion_key)::NUMERIC, 0)
+            ) * (v_cfg.essay_weight_pct / 100.0) AS weighted_essay_70
+        FROM essay_scores es
+        JOIN judge_sessions js ON js.submission_id = es.submission_id AND js.judge_id = es.judge_id
+        JOIN active_judge_weights ajw ON ajw.judge_id = es.judge_id
+        WHERE js.status = 'locked_final'
+        GROUP BY es.submission_id, es.judge_id, ajw.j_weight, ajw.judge_type
+    ),
+    judge_conc_totals AS (
+        SELECT cs.submission_id, cs.judge_id, ajw.j_weight,
+            COALESCE(cs.final_raw_score, cs.initial_raw_score) AS conc_30
+        FROM conclusion_scores cs
+        JOIN judge_sessions js ON js.submission_id = cs.submission_id AND js.judge_id = cs.judge_id
+        JOIN active_judge_weights ajw ON ajw.judge_id = cs.judge_id
+        WHERE js.status = 'locked_final'
+    ),
+    aggregated_scores AS (
+        SELECT s.id AS submission_id,
+            ROUND(SUM(jet.weighted_essay_70 * jet.j_weight) / NULLIF(SUM(jet.j_weight), 0), 4) AS final_essay_score,
+            CASE WHEN cw.outcome = 'auto_zero' OR EXISTS (
+                SELECT 1 FROM flags f WHERE f.submission_id = s.id AND f.status = 'confirmed')
+                THEN 0
+                ELSE ROUND(SUM(jct.conc_30 * jct.j_weight) / NULLIF(SUM(jct.j_weight), 0), 4) END AS final_conc_score
+        FROM submissions s
+        JOIN candidates c ON c.id = s.candidate_id
+        LEFT JOIN conclusion_windows cw ON cw.submission_id = s.id
+        JOIN judge_essay_totals jet ON jet.submission_id = s.id
+        JOIN judge_conc_totals jct ON jct.submission_id = s.id AND jct.judge_id = jet.judge_id
+        WHERE s.status IN ('submitted', 'auto_locked') AND c.is_disqualified = FALSE
+        GROUP BY s.id, cw.outcome
+        HAVING COUNT(DISTINCT jet.judge_id) >= v_cfg.min_active_judges
+    ),
+    penalty_totals AS (
+        SELECT submission_id, SUM(points_deducted) AS total_penalty
+        FROM manual_penalties
+        GROUP BY submission_id
+    ),
+    ranked_submissions AS (
+        SELECT a.submission_id, a.final_essay_score, a.final_conc_score,
+            GREATEST(0, (a.final_essay_score + a.final_conc_score) - COALESCE(p.total_penalty, 0)) AS comp_score,
+            RANK() OVER (ORDER BY GREATEST(0, (a.final_essay_score + a.final_conc_score) - COALESCE(p.total_penalty, 0)) DESC, a.final_essay_score DESC) AS rnk
+        FROM aggregated_scores a
+        LEFT JOIN penalty_totals p ON p.submission_id = a.submission_id
+    )
+    SELECT comp_score INTO v_cutoff_score
+    FROM ranked_submissions
+    WHERE rnk = v_cfg.top_finalists_target;
+    
+    IF NOT FOUND THEN v_cutoff_score := 0; END IF;
+
+    -- Insert using the EXACT column names from your schema
+    INSERT INTO stage1_results (submission_id, essay_score, conclusion_score, composite_score, rank, is_in_blur_zone, settings_version)
+    SELECT submission_id, final_essay_score, final_conc_score, comp_score, rnk,
+           (comp_score >= v_cutoff_score - v_cfg.blur_margin AND comp_score <= v_cutoff_score + v_cfg.blur_margin) AS is_in_blur_zone,
+           v_cfg.version
+    FROM ranked_submissions;
+    
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+-- Drop all versions of the function to remove duplicates
+DROP FUNCTION IF EXISTS fn_select_finalists(INT);
+DROP FUNCTION IF EXISTS fn_select_finalists();
+
+CREATE OR REPLACE FUNCTION fn_select_finalists(p_top_n INT DEFAULT NULL)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_cfg settings%ROWTYPE;
+    v_N INT;
+    v_blur NUMERIC;
+    v_sn NUMERIC;
+    v_count INT;
+    v_result JSONB;
+BEGIN
+    SELECT * INTO v_cfg FROM settings WHERE is_active = TRUE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'No active settings row'; END IF;
+
+    -- Use the custom number if passed, else fallback to settings
+    v_N := COALESCE(p_top_n, v_cfg.top_finalists_target);
+    v_blur := v_cfg.blur_margin;
+
+    SELECT COUNT(*) INTO v_count FROM stage1_results;
+    IF v_count = 0 THEN RAISE EXCEPTION 'stage1_results is empty; run compute_stage1_results() first.'; END IF;
+
+    DELETE FROM finalists WHERE admitted_by IN ('rank', 'blur');
+
+    -- Get the score of the Nth candidate
+    SELECT composite_score INTO v_sn
+    FROM stage1_results
+    ORDER BY rank ASC, submission_id ASC
+    LIMIT 1 OFFSET (v_N - 1);
+
+    -- If there are fewer candidates than the number typed, use the lowest score available
+    IF v_sn IS NULL THEN
+        SELECT MIN(composite_score) INTO v_sn FROM stage1_results;
+    END IF;
+
+    -- Insert finalists: Everyone in Top N, PLUS anyone within the Blur Margin
+    INSERT INTO finalists (submission_id, stage1_rank, composite_score, admitted_by, status)
+    SELECT submission_id, rank, composite_score,
+           CASE WHEN rank <= v_N THEN 'rank' ELSE 'blur' END,
+           'pending_check'
+    FROM stage1_results
+    WHERE rank <= v_N OR (v_sn IS NOT NULL AND composite_score >= v_sn - v_blur);
+
+    SELECT jsonb_agg(jsonb_build_object(
+        'submission_id', f.submission_id,
+        'stage1_rank', f.stage1_rank,
+        'composite_score', f.composite_score,
+        'admitted_by', f.admitted_by,
+        'status', f.status
+    ) ORDER BY f.stage1_rank ASC, f.submission_id ASC)
+    INTO v_result
+    FROM finalists f;
+
+    RETURN COALESCE(v_result, '[]'::jsonb);
+END;
+$$;
+
+-- Reset phase so you can re-test cleanly
+UPDATE competition_state SET current_phase = 'stage_1_review' WHERE id = 1;
+CREATE OR REPLACE FUNCTION fn_list_stage2_finalists()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_judge_id INT := current_user_id();
+    v_result JSONB;
+BEGIN
+    IF v_judge_id IS NULL THEN
+        RAISE EXCEPTION 'Unauthorized: Judge identity required.';
+    END IF;
+
+    SELECT jsonb_agg(jsonb_build_object(
+        'submission_id', f.submission_id,
+        'participant_number', s.participant_number,
+        'stage1_rank', f.stage1_rank,
+        'composite_score', f.composite_score,
+        'has_my_score', EXISTS(
+            SELECT 1 FROM stage2_scores ss
+            WHERE ss.submission_id = f.submission_id
+              AND ss.judge_id = v_judge_id
+        )
+    ) ORDER BY s.participant_number ASC)
+    INTO v_result
+    FROM finalists f
+    JOIN submissions s ON s.id = f.submission_id
+    WHERE f.status = 'approved';  -- Changed to read from finalists table directly
+
+    RETURN COALESCE(v_result, '[]'::jsonb);
+END;
+$$;
+CREATE OR REPLACE FUNCTION submit_stage2_scores(
+    p_submission_id INT,
+    p_c1 NUMERIC,
+    p_c2 NUMERIC,
+    p_c3 NUMERIC,
+    p_c4 NUMERIC
+) RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_judge_id INT := current_user_id();
+    v_is_approved BOOLEAN;
+BEGIN
+    IF v_judge_id IS NULL THEN
+        RAISE EXCEPTION 'Unauthorized: Judge identity required.';
+    END IF;
+
+    -- Check if the submission is an approved finalist in the NEW finalists table
+    SELECT EXISTS (
+        SELECT 1 FROM finalists f
+        WHERE f.submission_id = p_submission_id
+          AND f.status = 'approved'
+    ) INTO v_is_approved;
+
+    IF NOT v_is_approved THEN
+        RAISE EXCEPTION 'Submission % is not an approved finalist; cannot record Stage 2 scores.', p_submission_id;
+    END IF;
+
+    -- Insert or update the scores
+    INSERT INTO stage2_scores (submission_id, judge_id, criterion_key, raw_score)
+    VALUES 
+        (p_submission_id, v_judge_id, 'c1', p_c1),
+        (p_submission_id, v_judge_id, 'c2', p_c2),
+        (p_submission_id, v_judge_id, 'c3', p_c3),
+        (p_submission_id, v_judge_id, 'c4', p_c4)
+    ON CONFLICT (submission_id, judge_id, criterion_key) 
+    DO UPDATE SET raw_score = EXCLUDED.raw_score, submitted_at = NOW();
+END;
+$$;
+CREATE OR REPLACE FUNCTION compute_final_results()
+RETURNS INT LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_cfg settings%ROWTYPE;
+    v_count INT;
+BEGIN
+    SELECT * INTO v_cfg FROM settings WHERE is_active = TRUE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'No active settings configuration found.'; END IF;
+    
+    DELETE FROM final_results;
+    
+    WITH approved_finalists AS (
+        SELECT submission_id FROM finalists WHERE status = 'approved'
+    ),
+    stage1 AS (
+        SELECT sr.submission_id, sr.composite_score AS stage1_score
+        FROM stage1_results sr
+        JOIN approved_finalists af ON af.submission_id = sr.submission_id
+    ),
+    judge_stage2_weights AS (
+        SELECT id AS judge_id, judge_type,
+            CASE WHEN judge_type = 'external' THEN 100.0 / 3.0 ELSE 1.0 END AS scale_factor
+        FROM judges WHERE is_active = TRUE
+    ),
+    stage2_raw AS (
+        SELECT ss.submission_id, ss.judge_id,
+            SUM(ss.raw_score * jsw.scale_factor * COALESCE((v_cfg.stage2_criteria_weights ->> ss.criterion_key)::NUMERIC, 0)) AS weighted_score
+        FROM stage2_scores ss
+        JOIN judge_stage2_weights jsw ON jsw.judge_id = ss.judge_id
+        GROUP BY ss.submission_id, ss.judge_id
+    ),
+    stage2_final AS (
+        SELECT submission_id, ROUND(AVG(weighted_score), 4) AS stage2_score
+        FROM stage2_raw
+        GROUP BY submission_id
+    ),
+    combined AS (
+        SELECT s1.submission_id, s1.stage1_score, COALESCE(s2.stage2_score, 0) AS stage2_score,
+            GREATEST(0, (s1.stage1_score * v_cfg.stage1_overall_weight) + (COALESCE(s2.stage2_score, 0) * v_cfg.stage2_overall_weight)) AS overall_score
+        FROM stage1 s1
+        LEFT JOIN stage2_final s2 ON s2.submission_id = s1.submission_id
+    ),
+    ranked AS (
+        SELECT submission_id, stage1_score, stage2_score, overall_score,
+            RANK() OVER (ORDER BY overall_score DESC, stage1_score DESC) AS rnk
+        FROM combined
+    )
+    INSERT INTO final_results (submission_id, stage1_score, stage2_score, overall_score, final_rank, settings_version)
+    SELECT submission_id, stage1_score, stage2_score, overall_score, rnk, v_cfg.version
+    FROM ranked;
+    
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+-- 1. First, clear out the stuck scores and reset the session for the test candidate
+DELETE FROM essay_scores WHERE submission_id = 1 AND judge_id = 1;
+DELETE FROM conclusion_scores WHERE submission_id = 1 AND judge_id = 1;
+UPDATE judge_sessions SET status = 'phase_1_in_progress', phase_1_locked_at = NULL, phase_2_expires_at = NULL WHERE submission_id = 1 AND judge_id = 1;
+
+-- 2. Replace the function with the crash-proof UPSERT version
+CREATE OR REPLACE FUNCTION lock_phase1_scores(
+    p_submission_id INT,
+    p_c1 NUMERIC,
+    p_c2 NUMERIC,
+    p_c3 NUMERIC,
+    p_c4 NUMERIC,
+    p_c5 NUMERIC,
+    p_conclusion_score NUMERIC,
+    p_zero_score_reason TEXT DEFAULT NULL
+) RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_judge_id INT := current_user_id();
+    v_session_status TEXT;
+    v_window_outcome TEXT;
+    v_final_conc_score NUMERIC := p_conclusion_score;
+    v_final_zero_reason TEXT := p_zero_score_reason;
+    v_phase2_secs INT;
+    v_expires_at TIMESTAMPTZ;
+BEGIN
+    IF v_judge_id IS NULL THEN
+        RAISE EXCEPTION 'Unauthorized: Judge identity required.';
+    END IF;
+
+    SELECT status INTO v_session_status
+    FROM judge_sessions
+    WHERE submission_id = p_submission_id AND judge_id = v_judge_id
+    FOR UPDATE;
+
+    IF NOT FOUND OR v_session_status <> 'phase_1_in_progress' THEN
+        RAISE EXCEPTION 'Session is not in Phase 1 (current status: %).', COALESCE(v_session_status, 'none');
+    END IF;
+
+    -- Check if candidate conclusion was auto_zero
+    SELECT outcome INTO v_window_outcome
+    FROM conclusion_windows
+    WHERE submission_id = p_submission_id;
+
+    IF v_window_outcome = 'auto_zero' THEN
+        v_final_conc_score := 0;
+        v_final_zero_reason := COALESCE(p_zero_score_reason, 'System auto-zero: Conclusion window expired or unanswered.');
+    END IF;
+
+    -- Insert initial essay scores (Now with ON CONFLICT for safety)
+    INSERT INTO essay_scores (submission_id, judge_id, criterion_key, initial_raw_score) VALUES
+        (p_submission_id, v_judge_id, 'c1', p_c1),
+        (p_submission_id, v_judge_id, 'c2', p_c2),
+        (p_submission_id, v_judge_id, 'c3', p_c3),
+        (p_submission_id, v_judge_id, 'c4', p_c4),
+        (p_submission_id, v_judge_id, 'c5', p_c5)
+    ON CONFLICT (submission_id, judge_id, criterion_key) DO UPDATE 
+    SET initial_raw_score = EXCLUDED.initial_raw_score;
+
+    -- Insert initial conclusion score (Now with ON CONFLICT for safety)
+    INSERT INTO conclusion_scores (submission_id, judge_id, initial_raw_score, zero_score_reason)
+    VALUES (p_submission_id, v_judge_id, v_final_conc_score, v_final_zero_reason)
+    ON CONFLICT (submission_id, judge_id) DO UPDATE 
+    SET initial_raw_score = EXCLUDED.initial_raw_score,
+        zero_score_reason = EXCLUDED.zero_score_reason;
+
+    -- Calculate Phase 2 expiry (5 minutes by default)
+    SELECT phase2_window_seconds INTO v_phase2_secs FROM settings WHERE is_active = TRUE;
+    v_expires_at := NOW() + make_interval(secs => COALESCE(v_phase2_secs, 300));
+
+    -- Transition session to phase_2_review
+    UPDATE judge_sessions
+    SET status = 'phase_2_review',
+        phase_1_locked_at = NOW(),
+        phase_2_expires_at = v_expires_at
+    WHERE submission_id = p_submission_id AND judge_id = v_judge_id;
+
+    INSERT INTO audit_log (actor_role, actor_id, action, target_type, target_id, details)
+    VALUES ('judge', v_judge_id, 'phase_1_scores_locked', 'submission', p_submission_id,
+            jsonb_build_object('c1', p_c1, 'c2', p_c2, 'c3', p_c3, 'c4', p_c4, 'c5', p_c5, 'conclusion', v_final_conc_score));
+
+    RETURN v_expires_at;
+END;
+$$;
+-- 1. Clear the stuck scores again
+DELETE FROM essay_scores WHERE submission_id = 1 AND judge_id = 1;
+DELETE FROM conclusion_scores WHERE submission_id = 1 AND judge_id = 1;
+UPDATE judge_sessions SET status = 'phase_1_in_progress', phase_1_locked_at = NULL, phase_2_expires_at = NULL WHERE submission_id = 1 AND judge_id = 1;
+
+-- 2. Replace the function with the DO NOTHING version
+CREATE OR REPLACE FUNCTION lock_phase1_scores(
+    p_submission_id INT,
+    p_c1 NUMERIC,
+    p_c2 NUMERIC,
+    p_c3 NUMERIC,
+    p_c4 NUMERIC,
+    p_c5 NUMERIC,
+    p_conclusion_score NUMERIC,
+    p_zero_score_reason TEXT DEFAULT NULL
+) RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_judge_id INT := current_user_id();
+    v_session_status TEXT;
+    v_window_outcome TEXT;
+    v_final_conc_score NUMERIC := p_conclusion_score;
+    v_final_zero_reason TEXT := p_zero_score_reason;
+    v_phase2_secs INT;
+    v_expires_at TIMESTAMPTZ;
+BEGIN
+    IF v_judge_id IS NULL THEN
+        RAISE EXCEPTION 'Unauthorized: Judge identity required.';
+    END IF;
+
+    SELECT status INTO v_session_status
+    FROM judge_sessions
+    WHERE submission_id = p_submission_id AND judge_id = v_judge_id
+    FOR UPDATE;
+
+    IF NOT FOUND OR v_session_status <> 'phase_1_in_progress' THEN
+        RAISE EXCEPTION 'Session is not in Phase 1 (current status: %).', COALESCE(v_session_status, 'none');
+    END IF;
+
+    -- Check if candidate conclusion was auto_zero
+    SELECT outcome INTO v_window_outcome
+    FROM conclusion_windows
+    WHERE submission_id = p_submission_id;
+
+    IF v_window_outcome = 'auto_zero' THEN
+        v_final_conc_score := 0;
+        v_final_zero_reason := COALESCE(p_zero_score_reason, 'System auto-zero: Conclusion window expired or unanswered.');
+    END IF;
+
+    -- Insert essay scores. If they already exist, ignore. (Prevents trigger crash)
+    INSERT INTO essay_scores (submission_id, judge_id, criterion_key, initial_raw_score) VALUES
+        (p_submission_id, v_judge_id, 'c1', p_c1),
+        (p_submission_id, v_judge_id, 'c2', p_c2),
+        (p_submission_id, v_judge_id, 'c3', p_c3),
+        (p_submission_id, v_judge_id, 'c4', p_c4),
+        (p_submission_id, v_judge_id, 'c5', p_c5)
+    ON CONFLICT (submission_id, judge_id, criterion_key) DO NOTHING;
+
+    -- Insert conclusion score. If it already exists, ignore.
+    INSERT INTO conclusion_scores (submission_id, judge_id, initial_raw_score, zero_score_reason)
+    VALUES (p_submission_id, v_judge_id, v_final_conc_score, v_final_zero_reason)
+    ON CONFLICT (submission_id, judge_id) DO NOTHING;
+
+    -- Calculate Phase 2 expiry (5 minutes by default)
+    SELECT phase2_window_seconds INTO v_phase2_secs FROM settings WHERE is_active = TRUE;
+    v_expires_at := NOW() + make_interval(secs => COALESCE(v_phase2_secs, 300));
+
+    -- Transition session to phase_2_review
+    UPDATE judge_sessions
+    SET status = 'phase_2_review',
+        phase_1_locked_at = NOW(),
+        phase_2_expires_at = v_expires_at
+    WHERE submission_id = p_submission_id AND judge_id = v_judge_id;
+
+    INSERT INTO audit_log (actor_role, actor_id, action, target_type, target_id, details)
+    VALUES ('judge', v_judge_id, 'phase_1_scores_locked', 'submission', p_submission_id,
+            jsonb_build_object('c1', p_c1, 'c2', p_c2, 'c3', p_c3, 'c4', p_c4, 'c5', p_c5, 'conclusion', v_final_conc_score));
+
+    RETURN v_expires_at;
+END;
+$$;

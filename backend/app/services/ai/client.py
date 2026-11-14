@@ -77,15 +77,22 @@ def _parse_json_content(content: str) -> dict:
             text = text[:-3]
     text = text.strip()
 
+    def _ensure_dict(obj):
+        # If the AI wraps the output in a list like [{"score": 5}], unwrap it.
+        if isinstance(obj, list) and len(obj) > 0:
+            if isinstance(obj[0], dict):
+                return obj[0]
+        return obj
+
     try:
-        return json.loads(text)
+        return _ensure_dict(json.loads(text))
     except json.JSONDecodeError:
         pass
 
     first, last = text.find("{"), text.rfind("}")
     if first != -1 and last > first:
         try:
-            return json.loads(text[first:last + 1])
+            return _ensure_dict(json.loads(text[first:last + 1]))
         except json.JSONDecodeError:
             pass
 

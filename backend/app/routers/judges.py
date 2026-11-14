@@ -232,7 +232,13 @@ async def get_submission_evaluation_view(submission_id: int, ctx=Depends(get_jud
         except (TypeError, AttributeError):
             pass
 
+    phase_res = await session.execute(
+        text("SELECT current_phase FROM competition_state WHERE id = 1")
+    )
+    global_phase = phase_res.scalar_one()
+
     return {
+        "global_phase": global_phase,
         "submission": dict(sub),
         "bundle": bundle,
         "ai_claims": claims,
@@ -278,6 +284,11 @@ async def lock_phase1(
     ctx=Depends(get_judge_context),
 ):
     judge_id, session = ctx
+    
+    # Phase Guard: Only allow Stage 1 scoring during grading
+    phase_res = await session.execute(text("SELECT current_phase FROM competition_state WHERE id = 1"))
+    if phase_res.scalar_one() not in ('stage_1_grading', 'stage_1_review'):
+        raise HTTPException(403, detail="Stage 1 scoring is closed. The admin has advanced the competition.")
     jt = await session.execute(
         text("SELECT judge_type FROM judges WHERE id = current_user_id()")
     )

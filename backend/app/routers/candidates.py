@@ -522,3 +522,20 @@ async def submit_complaint(
     )
     return {"status": "submitted", "message": "Your complaint has been received by the admin."}
 
+@router.get("/final-rank")
+async def get_my_final_rank(ctx=Depends(get_candidate_context)):
+    candidate_id, session = ctx
+    res = await session.execute(
+        text("""
+            SELECT fr.final_rank, fr.overall_score
+            FROM final_results fr
+            JOIN submissions s ON s.id = fr.submission_id
+            WHERE s.candidate_id = :cid
+        """),
+        {"cid": candidate_id}
+    )
+    row = res.mappings().first()
+    if not row:
+        return {"rank": None}
+    return {"rank": row.final_rank, "score": row.overall_score}
+

@@ -306,6 +306,18 @@ class SettingsUpdateRequest(BaseModel):
     rubric_version: Optional[str] = Field(default=None, min_length=1, max_length=50)
 
 
+
+@router.get("/settings")
+async def get_active_settings(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    res = await session.execute(
+        text("SELECT * FROM settings WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
+    )
+    row = res.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="No active settings configuration found")
+    return dict(row)
+
 @router.put("/settings")
 async def update_settings(
     payload: SettingsUpdateRequest,
@@ -780,10 +792,14 @@ async def toggle_judge_active(
     }
 
 
+class ComputeStage1Request(BaseModel):
+    top_n: int | None = None
+
 @router.post("/compute-stage1")
-async def trigger_stage1_computation(ctx=Depends(get_admin_context)):
+async def trigger_stage1_computation(payload: ComputeStage1Request = ComputeStage1Request(), ctx=Depends(get_admin_context)):
     admin_id, session = ctx
     await session.execute(text("SELECT compute_stage1_results()"))
+    await session.execute(text("SELECT fn_select_finalists(:top_n)"), {"top_n": payload.top_n})
 
     res = await session.execute(
         text(
@@ -1110,7 +1126,7 @@ async def list_all_candidates(ctx=Depends(get_admin_context)):
     admin_id, session = ctx
     res = await session.execute(
         text("""
-            SELECT c.id, c.participant_number, c.full_name, c.matric_number, c.is_disqualified, c.disqualification_reason,
+            SELECT c.id, c.participant_number, c.full_name, c.matric_number, c.linkedin_url, c.is_disqualified, c.disqualification_reason,
                    s.id AS submission_id, s.status AS submission_status,
                    sr.composite_score,
                    (SELECT COUNT(DISTINCT judge_id) FROM judge_sessions WHERE submission_id = s.id AND status = 'locked_final') AS judges_scored,
@@ -1135,4 +1151,220 @@ async def get_candidate_essay(submission_id: int, ctx=Depends(get_admin_context)
     if not row:
         raise HTTPException(404, detail="Submission not found")
     return {"text": row.canonical_text}
+
+@router.post("/users/{role}/{user_id}/reset-password")
+async def reset_user_password(role: str, user_id: int, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    if role != "candidate":
+        raise HTTPException(403, detail="Security Policy: Only candidate passwords can be reset via this endpoint.")
+        
+    table = "judges" if role == "judge" else "candidates"
+    temp_password = "TempPass2026!"
+    
+    # We need to use the same hashing function the auth uses
+    from app.core.security import get_password_hash
+    hashed = get_password_hash(temp_password)
+    
+    if role == "judge":
+        await session.execute(
+            text(f"UPDATE {table} SET password_hash = :hash, is_active = TRUE, must_change_password = TRUE WHERE id = :id"),
+            {"hash": hashed, "id": user_id}
+        )
+    else:
+        # Candidates don't have is_active, just update password
+        await session.execute(
+            text(f"UPDATE {table} SET password_hash = :hash, must_change_password = TRUE WHERE id = :id"),
+            {"hash": hashed, "id": user_id}
+        )
+        
+    return {"status": "success", "temp_password": temp_password}
+
+@router.get("/help-requests")
+async def list_help_requests(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    res = await session.execute(
+        text("""
+            SELECT h.id, h.message, h.status, h.created_at,
+                   c.id AS candidate_id, c.participant_number, c.full_name, c.matric_number
+            FROM help_requests h
+            JOIN candidates c ON c.id = h.candidate_id
+            ORDER BY h.created_at DESC
+        """)
+    )
+    return [dict(r) for r in res.mappings().all()]
+
+@router.post("/help-requests/{req_id}/resolve")
+async def resolve_help_request(req_id: int, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    await session.execute(
+        text("UPDATE help_requests SET status = 'resolved' WHERE id = :id"),
+        {"id": req_id}
+    )
+    return {"status": "resolved"}
+
+@router.get("/notification-counts")
+async def get_notification_counts(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    comp_res = await session.execute(text("SELECT COUNT(*) FROM complaints WHERE status = 'open'"))
+    help_res = await session.execute(text("SELECT COUNT(*) FROM help_requests WHERE status = 'open'"))
+    return {"total": comp_res.scalar_one() + help_res.scalar_one()}
+
+class JudgePasswordRequest(BaseModel):
+    new_password: str = Field(..., min_length=8)
+
+@router.post("/users/judge/{judge_id}/manual-password")
+async def manual_judge_password(judge_id: int, payload: JudgePasswordRequest, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    from app.core.security import get_password_hash
+    hashed = get_password_hash(payload.new_password)
+    
+    await session.execute(
+        text("UPDATE judges SET password_hash = :hash, is_active = TRUE WHERE id = :id"),
+        {"hash": hashed, "id": judge_id}
+    )
+    return {"status": "success"}
+
+@router.get("/finalists/list")
+async def list_finalists_for_check(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    res = await session.execute(
+        text("""
+            SELECT f.submission_id, f.stage1_rank, f.composite_score, f.admitted_by, f.status,
+                   c.participant_number, c.full_name, c.matric_number
+            FROM finalists f
+            JOIN submissions s ON s.id = f.submission_id
+            JOIN candidates c ON c.id = s.candidate_id
+            ORDER BY f.stage1_rank ASC
+        """)
+    )
+    return [dict(r) for r in res.mappings().all()]
+
+class FinalistDecisionRequest(BaseModel):
+    decision: str # 'approved' or 'rejected'
+
+@router.post("/finalists/{submission_id}/decision")
+async def decide_finalist(submission_id: int, payload: FinalistDecisionRequest, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    if payload.decision not in ("approved", "rejected"):
+        raise HTTPException(400, detail="Invalid decision")
+        
+    await session.execute(
+        text("""
+            UPDATE finalists 
+            SET status = :decision, checked_at = NOW() 
+            WHERE submission_id = :sid
+        """),
+        {"decision": payload.decision, "sid": submission_id}
+    )
+    return {"status": "success", "decision": payload.decision}
+
+@router.get("/stage2/progress")
+async def get_stage2_progress(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    judges_res = await session.execute(text("SELECT COUNT(*) FROM judges WHERE is_active = TRUE"))
+    total_judges = judges_res.scalar_one()
+    
+    finalists_res = await session.execute(text("SELECT COUNT(*) FROM finalists WHERE status = 'approved'"))
+    total_finalists = finalists_res.scalar_one()
+    
+    completed_res = await session.execute(
+        text("""
+            SELECT COUNT(*) FROM (
+                SELECT judge_id, COUNT(DISTINCT submission_id) as scored_count
+                FROM stage2_scores
+                GROUP BY judge_id
+            ) j WHERE j.scored_count >= :total_f
+        """), {"total_f": total_finalists}
+    )
+    completed_judges = completed_res.scalar_one()
+    return {"total_judges": total_judges, "completed_judges": completed_judges, "total_finalists": total_finalists}
+
+@router.post("/compute-final")
+async def trigger_final_computation(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    phase_res = await session.execute(text("SELECT current_phase FROM competition_state WHERE id = 1"))
+    if phase_res.scalar_one() != 'stage_2_live':
+        raise HTTPException(400, detail="Final results can only be computed during 'stage_2_live'.")
+        
+    res = await session.execute(text("SELECT compute_final_results()"))
+    count = res.scalar_one()
+    await session.execute(text("UPDATE competition_state SET current_phase = 'completed' WHERE id = 1"))
+    return {"status": "success", "count": count}
+
+@router.get("/final-results")
+async def get_final_results(ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    res = await session.execute(
+        text("""
+            SELECT fr.submission_id, fr.final_rank, fr.overall_score, fr.stage1_score, fr.stage2_score,
+                   c.participant_number, c.full_name, c.matric_number
+            FROM final_results fr
+            JOIN submissions s ON s.id = fr.submission_id
+            JOIN candidates c ON c.id = s.candidate_id
+            ORDER BY fr.final_rank ASC
+        """)
+    )
+    return [dict(r) for r in res.mappings().all()]
+
+from app.services.ai.client import call_deepseek
+import json
+
+@router.post("/similarity-pairs/{pair_id}/ai-scan")
+async def ai_scan_similarity(pair_id: int, ctx=Depends(get_admin_context)):
+    admin_id, session = ctx
+    
+    # 1. Fetch the two essays
+    res = await session.execute(
+        text("""
+            SELECT sp.submission_a_id, sp.submission_b_id,
+                   sa.canonical_text AS text_a, sb.canonical_text AS text_b
+            FROM similarity_pairs sp
+            JOIN submissions sa ON sa.id = sp.submission_a_id
+            JOIN submissions sb ON sb.id = sp.submission_b_id
+            WHERE sp.id = :pid
+        """), {"pid": pair_id}
+    )
+    row = res.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="Pair not found")
+
+    # 2. Ask DeepSeek to compare them
+    prompt = f"""
+    You are an academic integrity checker for a financial essay competition.
+    Analyze the following two essays for SEMANTIC similarity.
+    Look for:
+    - Paraphrased sentences (same meaning, different words).
+    - The exact same arguments or logic flow.
+    - The exact same structural formatting or examples used.
+
+    Essay A:
+    {row['text_a']}
+
+    Essay B:
+    {row['text_b']}
+
+    Return a JSON object with exactly two keys:
+    - "similarity_score": an integer from 0 to 100.
+    - "reasoning": a short explanation of why you gave this score (max 3 sentences).
+    """
+    
+    try:
+        ai_res = await call_deepseek(prompt, temperature=0.2)
+        # The client wrapper handles the JSON parsing and list unwrapping
+        score = ai_res.get("similarity_score", 0)
+        reasoning = ai_res.get("reasoning", "No reasoning provided.")
+    except Exception as e:
+        raise HTTPException(500, detail=f"AI scan failed: {str(e)}")
+
+    # 3. Update the similarity_pairs table with the AI result
+    await session.execute(
+        text("""
+            UPDATE similarity_pairs 
+            SET similarity_score = :score, shared_passages = CAST(:reasoning AS jsonb)
+            WHERE id = :pid
+        """),
+        {"score": score, "reasoning": json.dumps(reasoning), "pid": pair_id}
+    )
+    
+    return {"status": "success", "ai_score": score, "ai_reasoning": reasoning}
 
